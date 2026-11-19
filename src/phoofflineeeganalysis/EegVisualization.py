@@ -1,57 +1,6 @@
 import matplotlib.pyplot as plt
 import numpy as np
 
-def plot_circular_eeg(channel_power, freqs, title=None):
-	# channel_power: numpy array of shape (numSamples,) for a specific channel
-	numSamples = len(channel_power)
-	max_freq = max(freqs)
-
-	# Plots radial frequency/power figure.
-	## TODO: Replace scatterplot with different plot object to better visualize the data. A standard plot(...) should work.
-	# r = 2 * max_power
-	r = 2 * channel_power
-	theta = 2 * np.pi * (freqs / max_freq)
-	# area = 200 * r ** 2
-	colors = theta
-	fig = plt.figure()
-	# ax = fig.add_subplot(111, projection='polar')
-	ax = fig.add_subplot(111, polar=True)
-	# c = ax.scatter(theta, r, c=colors, s=area, cmap='hsv', alpha=0.75)
-	# c = ax.scatter(theta, r, c=colors, cmap='hsv', alpha=0.75)
-	c = ax.plot(theta, r, alpha=0.75)
-
-	# render it like a donut instead of a circle: THIS ISN'T WORKING
-	# ax.set_rorigin(-250)
-	# ax.set_theta_zero_location('W', offset=10)
-	# Confine to a sector (pizza slice):
-	# ax.set_thetamin(45)
-	# ax.set_thetamax(135)
-
-	# currAx = fig.add_subplot(14,1,(aChannelIndex+1))
-	# currAx.psd(ch)
-
-	if title:
-		ax.set_title(title)
-
-
-
-def plot_linear_eeg(channel_power, freqs, title=None):
-	# channel_power: numpy array of shape (numSamples,) for a specific channel
-	numSamples = len(channel_power)
-	max_freq = max(freqs)
-
-	fig = plt.figure()
-	ax = fig.add_subplot(111)
-	# c = ax.scatter(theta, r, c=colors, s=area, cmap='hsv', alpha=0.75)
-	# c = ax.scatter(theta, r, c=colors, cmap='hsv', alpha=0.75)
-	c = ax.plot(freqs, channel_power, alpha=0.75)
-	ax.set_ylabel('Power')
-	ax.set_xlabel('Frequency [Hz]')
-	if title:
-		ax.set_title(title)
-
-
-
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -111,6 +60,58 @@ class VisHelpers:
 	hours_of_day_arr = ['Mid', '1 AM', '2 AM', '3 AM', '4 AM', '5 AM', '6 AM', '7 AM','8 AM','9 AM','10 AM','11 AM','Noon', '1 PM', '2 PM', '3 PM', '4 PM',  '5 PM', '6 PM', '7 PM', '8 PM', '9 PM', '10 PM', '11 PM' ]
 	days_arr = ["Mon","Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 	month_names_arr = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+	@classmethod
+	def plot_circular_eeg(cls, channel_power, freqs, title=None):
+		# channel_power: numpy array of shape (numSamples,) for a specific channel
+		numSamples = len(channel_power)
+		max_freq = max(freqs)
+
+		# Plots radial frequency/power figure.
+		## TODO: Replace scatterplot with different plot object to better visualize the data. A standard plot(...) should work.
+		# r = 2 * max_power
+		r = 2 * channel_power
+		theta = 2 * np.pi * (freqs / max_freq)
+		# area = 200 * r ** 2
+		colors = theta
+		fig = plt.figure()
+		# ax = fig.add_subplot(111, projection='polar')
+		ax = fig.add_subplot(111, polar=True)
+		# c = ax.scatter(theta, r, c=colors, s=area, cmap='hsv', alpha=0.75)
+		# c = ax.scatter(theta, r, c=colors, cmap='hsv', alpha=0.75)
+		c = ax.plot(theta, r, alpha=0.75)
+
+		# render it like a donut instead of a circle: THIS ISN'T WORKING
+		# ax.set_rorigin(-250)
+		# ax.set_theta_zero_location('W', offset=10)
+		# Confine to a sector (pizza slice):
+		# ax.set_thetamin(45)
+		# ax.set_thetamax(135)
+
+		# currAx = fig.add_subplot(14,1,(aChannelIndex+1))
+		# currAx.psd(ch)
+
+		if title:
+			ax.set_title(title)
+
+
+	@classmethod
+	def plot_linear_eeg(cls, channel_power, freqs, title=None):
+		# channel_power: numpy array of shape (numSamples,) for a specific channel
+		numSamples = len(channel_power)
+		max_freq = max(freqs)
+
+		fig = plt.figure()
+		ax = fig.add_subplot(111)
+		# c = ax.scatter(theta, r, c=colors, s=area, cmap='hsv', alpha=0.75)
+		# c = ax.scatter(theta, r, c=colors, cmap='hsv', alpha=0.75)
+		c = ax.plot(freqs, channel_power, alpha=0.75)
+		ax.set_ylabel('Power')
+		ax.set_xlabel('Frequency [Hz]')
+		if title:
+			ax.set_title(title)
+
 
 	# Plots the times in the dataframe df on a circular clock (as a function of the time-of-day)
 	@classmethod

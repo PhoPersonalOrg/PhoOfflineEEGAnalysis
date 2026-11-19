@@ -59,15 +59,6 @@ class LocalTimezone(tzinfo):
 Local = LocalTimezone()
 
 
-# A complete implementation of current DST rules for major US time zones.
-
-def first_sunday_on_or_after(dt):
-    days_to_go = 6 - dt.weekday()
-    if days_to_go:
-        dt += timedelta(days_to_go)
-    return dt
-
-
 # US DST Rules
 #
 # This is a simplified (i.e., wrong for a few cases) set of rules for US
@@ -93,22 +84,6 @@ DSTEND_1987_2006 = datetime(1, 10, 25, 2)
 DSTSTART_1967_1986 = datetime(1, 4, 24, 2)
 DSTEND_1967_1986 = DSTEND_1987_2006
 
-def us_dst_range(year):
-    # Find start and end times for US DST. For years before 1967, return
-    # start = end for no DST.
-    if 2006 < year:
-        dststart, dstend = DSTSTART_2007, DSTEND_2007
-    elif 1986 < year < 2007:
-        dststart, dstend = DSTSTART_1987_2006, DSTEND_1987_2006
-    elif 1966 < year < 1987:
-        dststart, dstend = DSTSTART_1967_1986, DSTEND_1967_1986
-    else:
-        return (datetime(year, 1, 1), ) * 2
-
-    start = first_sunday_on_or_after(dststart.replace(year=year))
-    end = first_sunday_on_or_after(dstend.replace(year=year))
-    return start, end
-
 
 class USTimeZone(tzinfo):
     """ 
@@ -116,14 +91,42 @@ class USTimeZone(tzinfo):
     from phoofflineeeganalysis.tzinfo_examples import USTimeZone
         
     """
+    @classmethod
+    def first_sunday_on_or_after(cls, dt):
+        days_to_go = 6 - dt.weekday()
+        if days_to_go:
+            dt += timedelta(days_to_go)
+        return dt
+
+
+    @classmethod
+    def us_dst_range(cls, year):
+        # Find start and end times for US DST. For years before 1967, return
+        # start = end for no DST.
+        if 2006 < year:
+            dststart, dstend = DSTSTART_2007, DSTEND_2007
+        elif 1986 < year < 2007:
+            dststart, dstend = DSTSTART_1987_2006, DSTEND_1987_2006
+        elif 1966 < year < 1987:
+            dststart, dstend = DSTSTART_1967_1986, DSTEND_1967_1986
+        else:
+            return (datetime(year, 1, 1), ) * 2
+
+        start = cls.first_sunday_on_or_after(dststart.replace(year=year))
+        end = cls.first_sunday_on_or_after(dstend.replace(year=year))
+        return start, end
+
+
     def __init__(self, hours, reprname, stdname, dstname):
         self.stdoffset = timedelta(hours=hours)
         self.reprname = reprname
         self.stdname = stdname
         self.dstname = dstname
 
+
     def __repr__(self):
         return self.reprname
+
 
     def tzname(self, dt):
         if self.dst(dt):
@@ -131,8 +134,10 @@ class USTimeZone(tzinfo):
         else:
             return self.stdname
 
+
     def utcoffset(self, dt):
         return self.stdoffset + self.dst(dt)
+
 
     def dst(self, dt):
         if dt is None or dt.tzinfo is None:
@@ -142,7 +147,7 @@ class USTimeZone(tzinfo):
             # implementation) passes a datetime with dt.tzinfo is self.
             return ZERO
         assert dt.tzinfo is self
-        start, end = us_dst_range(dt.year)
+        start, end = self.us_dst_range(dt.year)
         # Can't compare naive to aware objects, so strip the timezone from
         # dt first.
         dt = dt.replace(tzinfo=None)
@@ -158,9 +163,10 @@ class USTimeZone(tzinfo):
         # DST is off.
         return ZERO
 
+
     def fromutc(self, dt):
         assert dt.tzinfo is self
-        start, end = us_dst_range(dt.year)
+        start, end = self.us_dst_range(dt.year)
         start = start.replace(tzinfo=self)
         end = end.replace(tzinfo=self)
         std_time = dt + self.stdoffset

@@ -1,6 +1,6 @@
 [project]
 name = "phoofflineeeganalysis"
-version = "0.2.2"
+version = "0.3.3"
 description = "Add your description here"
 readme = "README.md"
 authors = [
@@ -12,7 +12,7 @@ dependencies = [
     "scipy>=1.13.1",
     "setuptools>=80.4.0",
     "wheel>=0.45.1",
-    "numpy>=1.20,<1.24", # "numpy~=1.20",
+    "numpy>=2.0.2",
     "qtpy>=2.4.3",
     "pyqt5==5.15.11",
     "pyqt5-qt5==5.15.2",
@@ -22,8 +22,6 @@ dependencies = [
     "mplcursors>=0.6",
     "cython>=3.1.2",
     "scikit-learn>=1.6.1",
-    "nptyping>=2.5.0",
-    "pandas>=1.5.3,<3.0.0",
     "pyinstaller>=6.14.2",
     "autoreject>=0.4.3",
     "pylsl>=1.16.2",
@@ -42,7 +40,7 @@ dependencies = [
     "h5py>=3.14.0",
     "fooof>=1.1.1",
     "pycryptodome>=3.23.0",
-    "python-benedict>=0.28.3,<0.29",
+    "python-benedict>=0.28.3",
     "mnelab>=0.8.6",
     "h5netcdf>=1.6.4",
     "tables>=3.9.2",
@@ -76,7 +74,7 @@ dependencies = [
     "trame>=3.12.0",
     "meshio>=5.3.5",
     "gmsh>=4.15.0",
-    "opencv-python>=4.8.0",
+    "opencv-python>=4.5.0",
     "phopymnehelper",
     "py-pho-timeline",
     "deffcode>=0.2.6",
@@ -84,6 +82,8 @@ dependencies = [
     "vidgear[asyncio]>=0.3.3",
     "imageio>=2.37.2",
     "pyarrow>=23.0.0",
+    "pyprep>=0.6.0",
+    "pandas>=2.2.0",
 ]
 
 [project.scripts]
@@ -94,14 +94,17 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.uv]
+# pyphocorehelpers (transitive via py-pho-timeline) pins pandas 1.5.3, which does not support numpy 2.x ABI.
+override-dependencies = ["pandas>=2.2.0"]
+
 [tool.uv.sources]
 # WARNING: Dev mne requires numpy>=1.26, which conflicts with pyphocorehelpers (numpy<1.24)
 # This will cause resolution failures on darwin, but may work on Windows
 # If you need to lock on Windows only, you may need to temporarily remove this source
 mne = { path = "../mne-python", editable = true }
-phopylslhelper = { path = "../PhoPyLSLhelper", editable = true }
 phopymnehelper = { path = "../PhoPyMNEHelper", editable = true }
 py-pho-timeline = { path = "../pyPhoTimeline", editable = true }
+phopylslhelper = { path = "../PhoPyLSLhelper", editable = true }
 
 [tool.pyrefly]
 project-includes = [

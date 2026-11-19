@@ -6,12 +6,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 
 import mne
-from phopymnehelper.analysis.computations.EEG_data import EEGComputations
+from phopymnehelper.EEG_data import EEGComputations
+from phopymnehelper.exporters.ZarrSerialization_Exporter import ZarrSerialization
 from matplotlib.backends.backend_pdf import PdfPages
 from datetime import datetime, timezone, timedelta
 import matplotlib.pyplot as plt
 
-import autoreject # apply_autoreject_filter
+from phopymnehelper.exporters.HDF5_Exporter import HDF5Exporter
 
 
 plt.rcParams["axes.titlesize"] = 8
@@ -42,985 +43,746 @@ from holoviews.operation.downsample import downsample1d # requiired for `plot_ho
 
 
 
-def plot_holoviews_multichannel_raw(a_raw, time_col_name: str='time', enable_downsampling: bool=True) -> Union[hv.Overlay, hv.DynamicMap]:
+class PendingNotebookCode:
     """
-    plots a raw EEG
-
-    Usage:
-        from phoofflineeeganalysis.PendingNotebookCode import plot_holoviews_multichannel_raw
-
-        curves_overlay_lttb = plot_holoviews_multichannel_raw(a_raw, time_col_name = 'times')
-
+    Pending Notebook Code helper methods.
     """
-    df = a_raw.to_data_frame()
-    df.set_index(time_col_name, inplace=True) 
-
-    time_dim = hv.Dimension(time_col_name, unit="s") # match the df index name, time_col_name
-    curves = {}
-    for col in df.columns:
-        col_amplitude_dim = hv.Dimension(col, label='amplitude', unit="µV") # map amplitude-labeled dim per chan
-        curves[col] = hv.Curve(df, time_dim, col_amplitude_dim, group='EEG', label=col)
-        # Apply options
-        curves[col] = curves[col].opts(
-            subcoordinate_y=True, # Essential to create vertically stacked plot
-            subcoordinate_scale=3,
-            color="black",
-            bgcolor="whitesmoke",
-            line_width=1,
-            hover_tooltips = [
-                ("type", "$group"),
-                ("channel", "$label"),
-                (time_col_name),
-                ("amplitude")],
-            tools=['xwheel_zoom'],
-            active_tools=["box_zoom"]
-        )
-    curves_overlay = hv.Overlay(curves, kdims=[time_dim, 'Channel'])
-
-    overlay_opts = dict(ylabel="Channel",
-        show_legend=False,
-        padding=0,
-        min_height=600,
-        responsive=True,
-        title="",
-    )
-
-    curves_overlay = curves_overlay.opts(**overlay_opts)
-
-    ### Apply Downsampling
-    if enable_downsampling:
-        curves_overlay_lttb = downsample1d(curves_overlay, algorithm='minmax-lttb')
-        return curves_overlay_lttb
-    else:
-        return curves_overlay
-
-
-
-# @function_attributes(short_name=None, tags=['working', 'spectogram'], input_requires=[], output_provides=[], uses=[], used_by=[], creation_date='2025-10-01 16:58', related_items=[])
-def plot_scrollable_spectogram(ds_disk, channels_to_select=None, fig_export_path="spectrogram_sessions.html", plot_indiv_channels: bool = False):
-    """ 
-    Plot EEG spectrograms with scrollable/zoomable time axis,
-    bandpower histograms, and selected channel spectrograms.
-
-    Usage:
-        from phoofflineeeganalysis.PendingNotebookCode import plot_scrollable_spectogram
-
-        _out = plot_scrollable_spectogram(ds_disk=partial_sess_ds, channels_to_select = ['AF3', 'F7', 'F3', 'FC5'], fig_export_path="spectrogram_sessions.html")
-        _out.show()
-
-    """
-    import numpy as np
-    import plotly.graph_objects as go
-    from plotly.subplots import make_subplots
-
-    available_channels = set(str(ch) for ch in ds_disk['channels'].values)
-
-    if channels_to_select is None:
-        channels_to_select = []
-    else:
-        # Ensure all requested channels exist in the dataset
-        missing = [ch for ch in channels_to_select if ch not in available_channels]
-        if missing:
-            raise ValueError(f"Channels not found in dataset: {missing}")
-
-    bands = {
-        "Delta (0.5-4 Hz)": (1.0, 4),
-        "Theta (4-8 Hz)": (4, 8),
-        "Alpha (8-13 Hz)": (8, 13),
-        "Beta (13-30 Hz)": (13, 30),
-        "Gamma (30-58 Hz)": (30, 58)
-    }
-
-    n_sessions = len(ds_disk.session)
-    if plot_indiv_channels:
-        n_extra_channels = len(channels_to_select)
-    else:
-        n_extra_channels = 0
-
-    n_extra_cols = 2 * n_extra_channels
-    # The column_widths must match the number of columns
-    # Always: [0.6, 0.2] for avg, then for each channel: [0.6, 0.2]
-    # over_time_summary_subplot_width_ratio = [0.6, 0.2]
-    over_time_summary_subplot_width_ratio = [0.95, 0.05]
-    column_widths = over_time_summary_subplot_width_ratio
-    if plot_indiv_channels:
-         column_widths = column_widths + (over_time_summary_subplot_width_ratio * n_extra_channels)
-
-    fig = make_subplots(
-        rows=n_sessions, cols=(2 + n_extra_cols),
-        column_widths=column_widths,
-        shared_xaxes=False
-    )
-
-    # Extract data variable (power values)
-    if isinstance(ds_disk, xr.Dataset):
-        data = ds_disk["__xarray_dataarray_variable__"]
-    elif isinstance(ds_disk, xr.DataArray):
-        data = ds_disk
-    else:
-        raise NotImplementedError(f'unepxected type: {type(ds_disk)}\nds_disk: {ds_disk}')
-
-
-    n_channels: int = len(available_channels)
-
-    if len(channels_to_select) > 0:
-        ## filter on active channels:
-        data = data.sel(channels=channels_to_select)
-
-    curr_active_channels = set(str(ch) for ch in data['channels'].values)
-    curr_n_active_channels: int = len(curr_active_channels)
-
-    for i, session in enumerate(ds_disk.session.values):
-        avg_spectrogram = data.sel(session=session).mean(dim="channels") ## average over channels
-
-        time = ds_disk["times"].values
-        freqs = ds_disk["freqs"].values
-        Z = 10 * np.log10(avg_spectrogram.values)
-
-        # --- 1) Add spectrogram (all channels avg)
-        row_col_dict = dict(row=i+1, col=1)
-        fig.add_trace(
-            go.Heatmap(
-                z=Z, x=time, y=freqs,
-                colorscale="Viridis",
-                colorbar=dict(title="Power (dB)"),
-            ),
-            **row_col_dict,
-        )
-        fig.update_yaxes(title_text=f"All {len(channels_to_select)} Channels Average\nFrequency (Hz)", **row_col_dict)
-
-        # --- 2) Bandpower histograms
-        band_means = []
-        for low, high in bands.values():
-            band_data = avg_spectrogram.sel(freqs=slice(low, high)).mean().values
-            band_means.append(10 * np.log10(band_data))
-
-        row_col_dict = dict(row=i+1, col=2)
-        fig.add_trace(
-            go.Bar(
-                x=band_means, y=list(bands.keys()),
-                orientation="h", marker_color="steelblue"
-            ),
-            **row_col_dict,
-        )
-
-        if plot_indiv_channels:
-            # --- 3) Individual channel spectrograms (optional)
-            for ch_idx, ch in enumerate(channels_to_select):
-                # Defensive: ensure channel exists
-                if ch not in ds_disk['channels'].values:
-                    raise ValueError(f"Channel '{ch}' not found in dataset channels: {ds_disk['channels'].values}")
-
-                ch_spec = data.sel(session=session, channels=ch)
-                Z_ch = 10 * np.log10(ch_spec.values)
-                # Each channel gets two columns: spectrogram, then bandpower
-                ch_col_spec = 3 + 2 * ch_idx
-                ch_col_band = 3 + 2 * ch_idx + 1
-
-                row_col_dict = dict(row=i+1, col=ch_col_spec)
-                fig.add_trace(
-                    go.Heatmap(
-                        z=Z_ch, x=time, y=freqs,
-                        colorscale="Viridis",
-                        # colorbar=dict(title="Power (dB)") if i == 0 else None,
-                        showscale=False,  # hide duplicate colorbars
-                        name=f"{ch} ({session})"
-                    ),
-                    **row_col_dict,
-                )
-                # fig.update_layout(title=f'{ch}', **row_col_dict)
-                fig.update_yaxes(title_text=f"{ch}", **row_col_dict)
-
-                # --- Bandpower histograms for this channel
-                band_means = []
-                for low, high in bands.values():
-                    band_data = ch_spec.sel(freqs=slice(low, high)).mean().values
-                    band_means.append(10 * np.log10(band_data))
-
-                row_col_dict = dict(row=i+1, col=ch_col_band)
-                fig.add_trace(
-                    go.Bar(
-                        x=band_means, y=list(bands.keys()),
-                        orientation="h", marker_color="steelblue"
-                    ),
-                    **row_col_dict,
-                )
-                # fig.update_layout(title=f'{ch}', **row_col_dict)
-                fig.update_yaxes(title_text=f"{ch}", **row_col_dict)
-        # END if plot_indiv_channels...
-    ## END for i, session in enumerate(ds_...
-
-    # Add clear, large session headers at the start of each row (session)
-    total_cols = 2 + n_extra_cols
-    for i, session in enumerate(ds_disk.session.values):
-        cognitive_status: str = ds_disk.cognitive_status.loc[session].item() ## these are indexed by 'session'
-        main_label_str: str = f"{session} - {cognitive_status}"
-        print(f'main_label_str: "{main_label_str}"')
-        subplot_index = i * total_cols + 1  # axis index for (row=i+1, col=1)
-        yaxis_name = "yaxis" if subplot_index == 1 else f"yaxis{subplot_index}"
-        # Domain is in figure paper coordinates [y0, y1]
-        y_domain = getattr(fig.layout, yaxis_name).domain
-        y_top = float(y_domain[1])
-        # Place the label just inside the top of the row, at the very left
-        # y_pos = y_top - 0.02
-        y_pos = y_top
-
-        fig.add_annotation(
-            # xref="paper", x=0.0, yref="paper", y=y_pos,
-            # xanchor="left", yanchor="top",
-            xref="paper", x=0.0, yref="paper", y=y_pos,
-            xanchor="left", yanchor="bottom",
-
-            text=main_label_str,
-            showarrow=False,
-            font=dict(size=20, color="black"),
-            bgcolor="rgba(255,255,255,0.75)",
-            bordercolor="black",
-            borderwidth=1,
-            align="left"
-        )
-    ## END for i, session in enumerate(ds_disk.sessi...
-
-    # Layout adjustments
-    fig.update_layout(
-        height=900,
-        # width=1800,
-        width=8800,
-        title="EEG Session Spectrograms with Bandpower + Selected Channels",
-        xaxis_title="Time (s)", yaxis_title=f"All {len(channels_to_select)} Channels Average\nFrequency (Hz)",
-    )
-
-    if fig_export_path is not None:
-        print(f'exporting figure to "{fig_export_path}"...')
-        fig.write_html(fig_export_path)
-
-    return fig
-
-
-
-
-# include = []
-
-
-
-def apply_autoreject_filter(a_raw, epoch_fixed_duration=3, should_plot: bool = False):
-    """ computes the bad epochs via the autoreject package, using global/local amplitude thresholds determined dynamically
-
-    Usage:
-        from phoofflineeeganalysis.PendingNotebookCode import apply_autoreject_filter
-
-        epochs_cleaned, (epochs, reject_log), ica = apply_autoreject_filter(a_raw, epoch_fixed_duration=3)
-        epochs
-        epochs_cleaned
-
-
-    """
-    a_raw.copy().filter(l_freq=1, h_freq=None)
-    epochs = mne.make_fixed_length_epochs(a_raw, duration=epoch_fixed_duration, preload=True)
-
-    # plot the data
-    # epochs.average().detrend().plot_joint()
-
-
-    # picks = mne.pick_types(a_raw.info, meg=True, eeg=True, stim=False,
-    #                        eog=True, include=include, exclude='bads')
-    # epochs = mne.Epochs(a_raw, events, event_id, tmin, tmax,
-    #                     picks=picks, baseline=(None, 0), preload=True,
-    #                     reject=None, verbose=False, detrend=1)
-
-    ar = autoreject.AutoReject(n_interpolate=[1, 2, 3], random_state=1337, n_jobs=1, verbose=True)
-    ar.fit(epochs[:20])  # fit on a few epochs to save time
-    epochs_cleaned, reject_log = ar.transform(epochs, return_log=True)
-
-    if should_plot:
-        epochs[reject_log.bad_epochs].plot(scalings=dict(eeg=100e-6))
-        reject_log.plot('horizontal')
-
-    # epochs[reject_log.bad_epochs].plot(scalings=dict(eeg=100e-6))
-
-    # compute ICA
-    ica = mne.preprocessing.ICA(random_state=1337)
-    ica.fit(epochs[~reject_log.bad_epochs])
-    exclude = [0,  # blinks
-            2  # saccades
-            ]
-    if should_plot:
-        ica.plot_components(exclude)
-    ica.exclude = exclude
-    if should_plot:
-        ica.plot_overlay(epochs.average(), exclude=ica.exclude)
-    ica.apply(epochs, exclude=ica.exclude)
-
-    return epochs_cleaned, (epochs, reject_log), ica
-
-
-def batch_compute_all_eeg_datasets(eeg_raws, limit_num_items: Optional[int]=None, max_workers: Optional[int]=None):
-    """ Main batch computation function
-
-    Compute EEG computations for all datasets in parallel using ThreadPoolExecutor.
-
-    Args:
-        eeg_raws: List of MNE Raw EEG datasets
-        limit_num_items: Limit processing to the last N items (None for all)
-        max_workers: Maximum number of parallel threads (None for auto-detect)
-
-    Returns:
-        List of computation results for each dataset
-
-    Usage:
-        # Basic parallel processing with automatic worker detection:
-        from phoofflineeeganalysis.PendingNotebookCode import compute_all_eeg_comps
-        results = compute_all_eeg_comps(eeg_raws=my_eeg_datasets)
-        print(f"Processed {len(results)} datasets")
-
-        # Process only the last 5 datasets using 4 workers:
-        results = compute_all_eeg_comps(
-            eeg_raws=my_eeg_datasets, 
-            limit_num_items=5, 
-            max_workers=4
-        )
-
-        # Performance comparison with sequential version:
-        import time
-        start = time.time()
-        par_results = compute_all_eeg_comps(eeg_datasets, max_workers=4)
-        par_time = time.time() - start
-        print(f"Parallel processing: {par_time:.2f}s")
-
-        # Error handling and validation:
-        results = compute_all_eeg_comps(eeg_datasets)
-        successful_count = sum(1 for r in results if r is not None)
-        print(f"Successfully processed {successful_count}/{len(results)} datasets")
-        failed_indices = [i for i, r in enumerate(results) if r is None]
-        if failed_indices:
-            print(f"Failed computations at indices: {failed_indices}")
-    """
-    ## INPUT: fixed_len_epochs
-    freqs = np.arange(5., 40., 1.0)
-    # Define frequencies and number of cycles
-    # freqs = np.logspace(*np.log10([2, 40]), num=20)
-    n_cycles = freqs / 2.0 # A common approach is to use a fixed number of cycles or a value that increases with frequency.
-
-    [a_raw.info.get('meas_date') for a_raw in eeg_raws]
-
-    if limit_num_items is not None:
-        limit_num_items = min(limit_num_items, len(eeg_raws))
-        active_only_out_eeg_raws = eeg_raws[-limit_num_items:] ## get only the last 3 items
-    else:
-        active_only_out_eeg_raws = eeg_raws ## get all items
-    # ## OUT: _active_only_out_eeg_raw
-    # [a_raw.info.get('meas_date') for a_raw in _active_only_out_eeg_raw]
-
-    # Determine optimal number of workers
-    if max_workers is None:
-        max_workers = min(len(active_only_out_eeg_raws), (os.cpu_count() or 4))
-    
-    print(f"Processing {len(active_only_out_eeg_raws)} EEG datasets using {max_workers} parallel workers...")
-
-    # Parallel processing using ThreadPoolExecutor
-    active_all_outputs_dict = [None] * len(active_only_out_eeg_raws)
-    
-    def process_single_eeg(idx_raw_tuple):
-        """Process a single EEG dataset"""
-        idx, a_raw = idx_raw_tuple
-        try:
-            meas_date = a_raw.info.get('meas_date', 'Unknown')
-            print(f"  Processing dataset {idx+1}/{len(active_only_out_eeg_raws)} (meas_date: {meas_date})")
-            result = EEGComputations.run_all(raw=a_raw)
-            print(f"  Completed dataset {idx+1}/{len(active_only_out_eeg_raws)} (meas_date: {meas_date})")
-            return idx, result
-        except Exception as e:
-            print(f"  ERROR processing dataset {idx+1}: {e}")
-            return idx, None
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all tasks
-        future_to_idx = {
-            executor.submit(process_single_eeg, (idx, raw)): idx 
-            for idx, raw in enumerate(active_only_out_eeg_raws)
-        }
-        
-        # Collect results as they complete
-        for future in as_completed(future_to_idx):
-            try:
-                idx, result = future.result()
-                active_all_outputs_dict[idx] = result
-            except Exception as e:
-                idx = future_to_idx[future]
-                print(f"  EXCEPTION in dataset {idx+1}: {e}")
-                active_all_outputs_dict[idx] = None
-
-    print(f"Completed processing all {len(active_only_out_eeg_raws)} EEG datasets.")
-    return active_only_out_eeg_raws, active_all_outputs_dict
-
-
-
-
-# @function_attributes(short_name=None, tags=['xarray'], input_requires=[], output_provides=[], uses=[], used_by=[], creation_date='2025-10-01 18:55', related_items=[])
-def build_merged(active_only_out_eeg_raws, results, day_status_dict, only_include_sessions_with_status_entries: bool = True) -> Union[xr.Dataset, xr.DataArray]:
-    """ 
-    from phoofflineeeganalysis.PendingNotebookCode import build_merged
-
-    cog_categorical_cats = ['cog_bad', 'cog_poor', 'cog_okay', 'cog_good', 'cog_great']
-
-    day_status_dict = {
-        '2025-09-19/01-54-39': 'cog_poor',
-        '2025-09-18/15-23-08': 'cog_poor',
-        '2025-09-22/21-35-47': 'cog_okay',
-        '2025-09-19/20-51-18': 'cog_good',
-        '2025-09-18/03-18-42': 'cog_great',
-        '2025-09-22/21-35-47': 'cog_bad',
-        '2025-09-21/08-55-41': 'cog_bad',
-    }
-
-
-    combined_ds, combined_da = build_merged(active_only_out_eeg_raws=active_only_out_eeg_raws, results=results, day_status_dict=day_status_dict)
-    combined_ds
-
-    """
-    num_sessions: int = len(active_only_out_eeg_raws)
-    all_Sxx = []
-    data_vars = {}
-    coords = {"session": [], "cognitive_status": []}
-    for an_xdf_dataset_idx in np.arange(num_sessions):
-        a_raw = active_only_out_eeg_raws[an_xdf_dataset_idx]
-        a_meas_date = a_raw.info.get('meas_date')
-        a_raw_key: str = a_meas_date.strftime("%Y-%m-%d/%H-%M-%S") # '2025-09-22/21-35-47'
-        a_status = day_status_dict.get(a_raw_key, None)
-        if (a_status is not None) or (not only_include_sessions_with_status_entries):
-            ## a status
-            if (a_status is None):
-                a_status = 'cog_UNLABELED' ## replace with 'cog_UNLABELED
-                day_status_dict[a_raw_key] = a_status ## set 'cog_UNLABELED'
-
-
-            a_result = results[an_xdf_dataset_idx]
-            Sxx = a_result['spectogram']['Sxx']
-            if a_status is not None:
-                Sxx = Sxx.assign_attrs(cognitive_status=a_status) # xarray.DataArray - channels: 14, freqs: 513, times: 1116
-
-            data_vars[a_raw_key] = Sxx
-            coords["session"].append(a_raw_key)
-            coords["cognitive_status"].append(a_status)
-
-            # Sxx ## TODO: save the xarray to a single file (as a list of xarrays for each `an_xdf_dataset_idx`
-            Sxx = Sxx.expand_dims(session=[a_raw_key])
-            all_Sxx.append(Sxx)
-    ## END for an_xdf_dataset_id...
-    combined_da = xr.concat(all_Sxx, dim="session")
-    # Assign cognitive_status as a coordinate on session dim
-    combined_da = combined_da.assign_coords(cognitive_status=("session", list(day_status_dict.values())))
-    combined_da = combined_da.assign_attrs(cognitive_status=list(day_status_dict.values()))
-
-    combined_ds: xr.Dataset = xr.Dataset(data_vars=data_vars, coords=coords)
-    combined_ds = combined_ds.assign_attrs(cognitive_status=list(day_status_dict.values()))
-
-    return (combined_ds, combined_da)
-
-
-
-
-import xarray as xr
-import zarr
-import numcodecs
-
-# @function_attributes(short_name=None, tags=['serialization'], input_requires=[], output_provides=[], uses=[], used_by=[], creation_date='2025-10-01 16:58', related_items=[])
-class ZarrSerialization:
-    """ Exports to Zarr for XArrays
-
-    import xarray as xr
-    import zarr
-    import numcodecs
-    import numpy as np
-    from pathlib import Path
-    from typing import Union
-    from phoofflineeeganalysis.PendingNotebookCode import ZarrSerialization
-
-    cog_categorical_cats = ['cog_bad', 'cog_poor', 'cog_okay', 'cog_good', 'cog_great']
-
-    day_status_dict = {
-        '2025-09-19/01-54-39': 'cog_poor',
-        '2025-09-18/15-23-08': 'cog_poor',
-        '2025-09-22/21-35-47': 'cog_okay',
-        '2025-09-19/20-51-18': 'cog_good',
-        '2025-09-18/03-18-42': 'cog_great',
-        '2025-09-22/21-35-47': 'cog_bad',
-        '2025-09-21/08-55-41': 'cog_bad',
-    }
-
-
-    zarr_out_path = Path("2025-09-30_all_sessions.zarr")
-
-    zarr_out_path = ZarrSerialization.save_sessions_as_zarr(active_only_out_eeg_raws=active_only_out_eeg_raws, results=results, day_status_dict=day_status_dict, out_path=zarr_out_path)
-
-    ## Immediately re-load from file
-    all_data = ZarrSerialization.load_sessions_from_zarr(zarr_out_path, verbose=True)
-
-    """
-    @classmethod
-    def load_sessions_from_zarr(cls, zarr_path: Union[str, Path], verbose: bool = False) -> xr.Dataset:
-        zarr_path = Path(zarr_path)
-        if not zarr_path.exists():
-            raise FileNotFoundError(f"Zarr store not found at {zarr_path}")
-
-        store = zarr.DirectoryStore(zarr_path)
-        root = zarr.open(store, mode="r")
-        session_keys = list(root.group_keys())
-        if verbose:
-            print("zarr groups:", session_keys)
-        if not session_keys:
-            raise ValueError(f"No session groups found in the Zarr store at {zarr_path}")
-
-        da_list: List[xr.DataArray] = []
-        for key in session_keys:
-            try:
-                ds = xr.open_zarr(store, group=key, consolidated=True)
-            except Exception as e:
-                if verbose: print(f"skipping group {key}: open_zarr error: {e}")
-                continue
-
-            # choose the DataArray: prefer 'Sxx' but fall back to the first data_var
-            if "Sxx" in ds.data_vars:
-                da = ds["Sxx"]
-                picked_name = "Sxx"
-            elif len(ds.data_vars) == 1:
-                picked_name = list(ds.data_vars)[0]
-                da = ds[picked_name]
-                if verbose: print(f"group {key}: no 'Sxx' var, picked '{picked_name}'")
-            else:
-                if verbose: print(f"skipping group {key}: no Sxx and multiple data_vars: {list(ds.data_vars)}")
-                continue
-
-            # normalize name to 'Sxx' for consistency
-            if da.name != "Sxx":
-                da = da.rename("Sxx")
-
-            session_key = ds.attrs.get("session_key", key)
-            cognitive_status = da.attrs.get("cognitive_status", "unknown")
-
-            # Expand with session dim labeled by session_key
-            da = da.expand_dims({"session": [session_key]})
-
-            # Assign cognitive_status as a coordinate on session dim
-            da = da.assign_coords(cognitive_status=("session", [cognitive_status]))
-
-            da_list.append(da)
-
-        if not da_list:
-            raise ValueError("No sessions with Sxx (or fallback data-var) found in Zarr store")
-
-        combined = xr.concat(da_list, dim="session", join="outer")
-
-        ds_combined = combined.to_dataset(name="Sxx")
-
-        # session_key coord (same labels as session dim)
-        sess_labels = [str(x) for x in ds_combined["session"].values.tolist()]
-        ds_combined = ds_combined.assign_coords(session_key=("session", sess_labels))
-
-        # ensure cognitive_status exists as session coord
-        if "cognitive_status" not in ds_combined.coords:
-            cs_vals = [da.coords.get("cognitive_status").values[0] if "cognitive_status" in da.coords else "unknown" for da in da_list]
-            ds_combined = ds_combined.assign_coords(cognitive_status=("session", cs_vals))
-
-        return ds_combined
-
 
     @classmethod
-    def save_sessions_as_zarr(cls, active_only_out_eeg_raws, results, day_status_dict, out_path="all_sessions.zarr"):
-        """ write out the result (spectogram) from each session in the `day_status_dict` to the out_path file
+    def plot_holoviews_multichannel_raw(cls, a_raw, time_col_name: str='time', enable_downsampling: bool=True) -> Union[hv.Overlay, hv.DynamicMap]:
+        """
+        plots a raw EEG
 
         Usage:
+            from phoofflineeeganalysis.PendingNotebookCode import PendingNotebookCode
 
-            cog_categorical_cats = ['cog_bad', 'cog_poor', 'cog_okay', 'cog_good', 'cog_great']
-
-            day_status_dict = {
-                '2025-09-19/01-54-39': 'cog_poor',
-                '2025-09-18/15-23-08': 'cog_poor',
-                '2025-09-22/21-35-47': 'cog_okay',
-                '2025-09-19/20-51-18': 'cog_good',
-                '2025-09-18/03-18-42': 'cog_great',
-                '2025-09-22/21-35-47': 'cog_bad',
-                '2025-09-21/08-55-41': 'cog_bad',
-            }
-
-
-            out_path = Path("2025-09-29_all_sessions.zarr")
-            out_path = save_sessions_as_zarr(active_only_out_eeg_raws=active_only_out_eeg_raws, results=results, day_status_dict=day_status_dict, out_path=out_path)
+            curves_overlay_lttb = PendingNotebookCode.plot_holoviews_multichannel_raw(a_raw, time_col_name = 'times')
 
         """
-        compressor = numcodecs.Blosc()
-        store = zarr.DirectoryStore(out_path)
-        num_sessions: int = len(active_only_out_eeg_raws)
+        df = a_raw.to_data_frame()
+        df.set_index(time_col_name, inplace=True) 
 
-        for idx in np.arange(num_sessions):
-            a_raw = active_only_out_eeg_raws[idx]
-            a_meas_date = a_raw.info.get('meas_date')
-            a_raw_key = a_meas_date.strftime("%Y-%m-%d/%H-%M-%S")
-            a_status = day_status_dict.get(a_raw_key, None)
-            if not a_status:
-                continue
+        time_dim = hv.Dimension(time_col_name, unit="s") # match the df index name, time_col_name
+        curves = {}
+        for col in df.columns:
+            col_amplitude_dim = hv.Dimension(col, label='amplitude', unit="µV") # map amplitude-labeled dim per chan
+            curves[col] = hv.Curve(df, time_dim, col_amplitude_dim, group='EEG', label=col)
+            # Apply options
+            curves[col] = curves[col].opts(
+                subcoordinate_y=True, # Essential to create vertically stacked plot
+                subcoordinate_scale=3,
+                color="black",
+                bgcolor="whitesmoke",
+                line_width=1,
+                hover_tooltips = [
+                    ("type", "$group"),
+                    ("channel", "$label"),
+                    (time_col_name),
+                    ("amplitude")],
+                tools=['xwheel_zoom'],
+                active_tools=["box_zoom"]
+            )
+        ## END for col in df.columns...
 
-            a_result = results[idx]
-            Sxx = a_result['spectogram']['Sxx']
-            Sxx = Sxx.assign_attrs(cognitive_status=a_status) # xarray.DataArray - channels: 14, freqs: 513, times: 1116
+        curves_overlay = hv.Overlay(curves, kdims=[time_dim, 'Channel'])
 
-            ds = Sxx.to_dataset(name='Sxx')
-            ds.attrs['session_key'] = a_raw_key
+        overlay_opts = dict(ylabel="Channel",
+            show_legend=False,
+            padding=0,
+            min_height=600,
+            responsive=True,
+            title="",
+        )
 
-            encoding = {v: {'compressor': compressor} for v in ds.data_vars}
-            ds.to_zarr(store, group=a_raw_key, mode='a', encoding=encoding)
+        curves_overlay = curves_overlay.opts(**overlay_opts)
 
-        zarr.consolidate_metadata(store)
-        return out_path
-
-
-
-def save_all_to_HDF5(_active_only_out_eeg_raw, _active_all_outputs_dict, hdf5_out_path: Path):
-    """
-        hdf5_out_path: Path = Path('E:/Dropbox (Personal)/Databases/AnalysisData/MNE_preprocessed/outputs').joinpath('2025-09-22_eegComputations.h5')
-    hdf5_out_path
-    """
-
-    for idx, (a_raw, a_raw_outputs) in enumerate(zip(_active_only_out_eeg_raw, _active_all_outputs_dict)):
-        # a_path: Path = Path(a_raw.filenames[0])
-        # basename: str = a_path.stem
-        # basename: str = a_raw.info.get('meas_date')
-        src_file_path: Path = Path(a_raw.info.get('description'))
-        basename: str = src_file_path.stem
-
-        print(f'basename: {basename}')
-
-        for an_output_key, an_output_dict in a_raw_outputs.items():
-            for an_output_subkey, an_output_value in an_output_dict.items():
-                final_data_key: str = '/'.join([basename, an_output_key, an_output_subkey])
-                print(f'\tfinal_data_key: "{final_data_key}"')
-                # all_WHISPER_df.drop(columns=['filepath']).to_hdf(hdf5_out_path, key='modalities/WHISPER/df', append=True)
-
-        # spectogram_result_dict = a_raw_outputs['spectogram']['spectogram_result_dict']
-        # fs = a_raw_outputs['spectogram']['fs']
-
-        # for ch_idx, (a_ch, a_ch_spect_result_tuple) in enumerate(spectogram_result_dict.items()):
-        #     all_WHISPER_df.drop(columns=['filepath']).to_hdf(hdf5_out_path, key='modalities/WHISPER/df', append=True)
-        #     all_pho_log_to_lsl_df.drop(columns=['filepath']).to_hdf(hdf5_out_path, key='modalities/PHO_LOG_TO_LSL/df', append=True)
-
-        #     all_pho_log_to_lsl_df.drop(columns=['filepath']).to_hdf(hdf5_out_path, key='modalities/PHO_LOG_TO_LSL/df', append=True)
+        ### Apply Downsampling
+        if enable_downsampling:
+            curves_overlay_lttb = downsample1d(curves_overlay, algorithm='minmax-lttb')
+            return curves_overlay_lttb
+        else:
+            return curves_overlay
 
 
-def plot_session_spectogram(a_raw, a_raw_outputs, sync_to_mne_raw_fig = None):
-    """ Plots the spectograms computed in `compute_all_eeg_comps(...)` for each raw EEG session in a separate matplotlib figure, with each channel being a separate row subplot. 
+    # @function_attributes(short_name=None, tags=['working', 'spectogram'], input_requires=[], output_provides=[], uses=[], used_by=[], creation_date='2025-10-01 16:58', related_items=[])
+    @classmethod
+    def plot_scrollable_spectogram(cls, ds_disk, channels_to_select=None, fig_export_path="spectrogram_sessions.html", plot_indiv_channels: bool = False):
+        """ 
+        Plot EEG spectrograms with scrollable/zoomable time axis,
+        bandpower histograms, and selected channel spectrograms.
 
-    Usage:
-        ## Plot a synchronized EEG Raw data and Spectogram Figure together:
-        mne_raw_fig = active_only_out_eeg_raws[0].plot(time_format='datetime', scalings='auto') # MNEBrowseFigure
-        fig, axs = plot_session_spectogram(active_only_out_eeg_raws[0], results[0], sync_to_mne_raw_fig=mne_raw_fig)
+        Usage:
+            from phoofflineeeganalysis.PendingNotebookCode import PendingNotebookCode
 
-    """
+            _out = PendingNotebookCode.plot_scrollable_spectogram(ds_disk=partial_sess_ds, channels_to_select = ['AF3', 'F7', 'F3', 'FC5'], fig_export_path="spectrogram_sessions.html")
+            _out.show()
+
+        """
+        import numpy as np
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+
+        available_channels = set(str(ch) for ch in ds_disk['channels'].values)
+
+        if channels_to_select is None:
+            channels_to_select = []
+        else:
+            # Ensure all requested channels exist in the dataset
+            missing = [ch for ch in channels_to_select if ch not in available_channels]
+            if missing:
+                raise ValueError(f"Channels not found in dataset: {missing}")
+
+        bands = {
+            "Delta (0.5-4 Hz)": (1.0, 4),
+            "Theta (4-8 Hz)": (4, 8),
+            "Alpha (8-13 Hz)": (8, 13),
+            "Beta (13-30 Hz)": (13, 30),
+            "Gamma (30-58 Hz)": (30, 58)
+        }
+
+        n_sessions = len(ds_disk.session)
+        if plot_indiv_channels:
+            n_extra_channels = len(channels_to_select)
+        else:
+            n_extra_channels = 0
+
+        n_extra_cols = 2 * n_extra_channels
+        # The column_widths must match the number of columns
+        # Always: [0.6, 0.2] for avg, then for each channel: [0.6, 0.2]
+        # over_time_summary_subplot_width_ratio = [0.6, 0.2]
+        over_time_summary_subplot_width_ratio = [0.95, 0.05]
+        column_widths = over_time_summary_subplot_width_ratio
+        if plot_indiv_channels:
+             column_widths = column_widths + (over_time_summary_subplot_width_ratio * n_extra_channels)
+
+        fig = make_subplots(
+            rows=n_sessions, cols=(2 + n_extra_cols),
+            column_widths=column_widths,
+            shared_xaxes=False
+        )
+
+        # Extract data variable (power values)
+        if isinstance(ds_disk, xr.Dataset):
+            data = ds_disk["__xarray_dataarray_variable__"]
+        elif isinstance(ds_disk, xr.DataArray):
+            data = ds_disk
+        else:
+            raise NotImplementedError(f'unepxected type: {type(ds_disk)}\nds_disk: {ds_disk}')
 
 
-    basename: str = a_raw.info.get('meas_date')
-    fig_identifier: str = f'spectrogram_all_channels[{basename}]'
+        n_channels: int = len(available_channels)
 
-    fig, axs = plt.subplots(nrows=len(a_raw.info.ch_names), ncols=1, num='spectrogram_all_channels', sharey=True, sharex=True, clear=True)
+        if len(channels_to_select) > 0:
+            ## filter on active channels:
+            data = data.sel(channels=channels_to_select)
 
-    spectogram_result_dict = a_raw_outputs['spectogram']['spectogram_result_dict']
-    fs = a_raw_outputs['spectogram']['fs']
+        curr_active_channels = set(str(ch) for ch in data['channels'].values)
+        curr_n_active_channels: int = len(curr_active_channels)
 
-    for ch_idx, (a_ch, a_ch_spect_result_tuple) in enumerate(spectogram_result_dict.items()):
-        f, t, Sxx = a_ch_spect_result_tuple
-        an_ax = axs[ch_idx]
-        an_ax.pcolormesh(t, f, 10*np.log10(Sxx+1e-12), shading='auto')
-        # plt.pcolormesh(t, f, 10*np.log10(Sxx+1e-12), shading='auto', ax=an_ax)
-        # an_ax.ylims([1, 40])
-        # ch_label: str = f"{a_ch}[{ch_idx}]"
-        ch_label: str = f"{a_ch}"
-        # plt.ylabel(f"{a_ch}[{ch_idx}]", ax=an_ax)
-        an_ax.set_ylabel(ch_label)
+        for i, session in enumerate(ds_disk.session.values):
+            avg_spectrogram = data.sel(session=session).mean(dim="channels") ## average over channels
+
+            time = ds_disk["times"].values
+            freqs = ds_disk["freqs"].values
+            Z = 10 * np.log10(avg_spectrogram.values)
+
+            # --- 1) Add spectrogram (all channels avg)
+            row_col_dict = dict(row=i+1, col=1)
+            fig.add_trace(
+                go.Heatmap(
+                    z=Z, x=time, y=freqs,
+                    colorscale="Viridis",
+                    colorbar=dict(title="Power (dB)"),
+                ),
+                **row_col_dict,
+            )
+            fig.update_yaxes(title_text=f"All {len(channels_to_select)} Channels Average\nFrequency (Hz)", **row_col_dict)
+
+            # --- 2) Bandpower histograms
+            band_means = []
+            for low, high in bands.values():
+                band_data = avg_spectrogram.sel(freqs=slice(low, high)).mean().values
+                band_means.append(10 * np.log10(band_data))
+            ## END for low, high in bands.values()...
+
+            row_col_dict = dict(row=i+1, col=2)
+            fig.add_trace(
+                go.Bar(
+                    x=band_means, y=list(bands.keys()),
+                    orientation="h", marker_color="steelblue"
+                ),
+                **row_col_dict,
+            )
+
+            if plot_indiv_channels:
+                # --- 3) Individual channel spectrograms (optional)
+                for ch_idx, ch in enumerate(channels_to_select):
+                    # Defensive: ensure channel exists
+                    if ch not in ds_disk['channels'].values:
+                        raise ValueError(f"Channel '{ch}' not found in dataset channels: {ds_disk['channels'].values}")
+
+                    ch_spec = data.sel(session=session, channels=ch)
+                    Z_ch = 10 * np.log10(ch_spec.values)
+                    # Each channel gets two columns: spectrogram, then bandpower
+                    ch_col_spec = 3 + 2 * ch_idx
+                    ch_col_band = 3 + 2 * ch_idx + 1
+
+                    row_col_dict = dict(row=i+1, col=ch_col_spec)
+                    fig.add_trace(
+                        go.Heatmap(
+                            z=Z_ch, x=time, y=freqs,
+                            colorscale="Viridis",
+                            # colorbar=dict(title="Power (dB)") if i == 0 else None,
+                            showscale=False,  # hide duplicate colorbars
+                            name=f"{ch} ({session})"
+                        ),
+                        **row_col_dict,
+                    )
+                    # fig.update_layout(title=f'{ch}', **row_col_dict)
+                    fig.update_yaxes(title_text=f"{ch}", **row_col_dict)
+
+                    # --- Bandpower histograms for this channel
+                    band_means = []
+                    for low, high in bands.values():
+                        band_data = ch_spec.sel(freqs=slice(low, high)).mean().values
+                        band_means.append(10 * np.log10(band_data))
+                    ## END for low, high in bands.values()...
+
+                    row_col_dict = dict(row=i+1, col=ch_col_band)
+                    fig.add_trace(
+                        go.Bar(
+                            x=band_means, y=list(bands.keys()),
+                            orientation="h", marker_color="steelblue"
+                        ),
+                        **row_col_dict,
+                    )
+                    # fig.update_layout(title=f'{ch}', **row_col_dict)
+                    fig.update_yaxes(title_text=f"{ch}", **row_col_dict)
+                ## END for ch_idx, ch in enumerate(channels_to_select)...
+            # END if plot_indiv_channels...
+        ## END for i, session in enumerate(ds_disk.session.values)...
+
+        # Add clear, large session headers at the start of each row (session)
+        total_cols = 2 + n_extra_cols
+        for i, session in enumerate(ds_disk.session.values):
+            cognitive_status: str = ds_disk.cognitive_status.loc[session].item() ## these are indexed by 'session'
+            main_label_str: str = f"{session} - {cognitive_status}"
+            print(f'main_label_str: "{main_label_str}"')
+            subplot_index = i * total_cols + 1  # axis index for (row=i+1, col=1)
+            yaxis_name = "yaxis" if subplot_index == 1 else f"yaxis{subplot_index}"
+            # Domain is in figure paper coordinates [y0, y1]
+            y_domain = getattr(fig.layout, yaxis_name).domain
+            y_top = float(y_domain[1])
+            # Place the label just inside the top of the row, at the very left
+            # y_pos = y_top - 0.02
+            y_pos = y_top
+
+            fig.add_annotation(
+                # xref="paper", x=0.0, yref="paper", y=y_pos,
+                # xanchor="left", yanchor="top",
+                xref="paper", x=0.0, yref="paper", y=y_pos,
+                xanchor="left", yanchor="bottom",
+
+                text=main_label_str,
+                showarrow=False,
+                font=dict(size=20, color="black"),
+                bgcolor="rgba(255,255,255,0.75)",
+                bordercolor="black",
+                borderwidth=1,
+                align="left"
+            )
+        ## END for i, session in enumerate(ds_disk.session.values)...
+
+        # Layout adjustments
+        fig.update_layout(
+            height=900,
+            # width=1800,
+            width=8800,
+            title="EEG Session Spectrograms with Bandpower + Selected Channels",
+            xaxis_title="Time (s)", yaxis_title=f"All {len(channels_to_select)} Channels Average\nFrequency (Hz)",
+        )
+
+        if fig_export_path is not None:
+            print(f'exporting figure to "{fig_export_path}"...')
+            fig.write_html(fig_export_path)
+
+        return fig
+
+
+    @classmethod
+    def batch_compute_all_eeg_datasets(cls, eeg_raws, limit_num_items: Optional[int]=None, max_workers: Optional[int]=None):
+        """ Main batch computation function
+
+        Compute EEG computations for all datasets in parallel using ThreadPoolExecutor.
+
+        Args:
+            eeg_raws: List of MNE Raw EEG datasets
+            limit_num_items: Limit processing to the last N items (None for all)
+            max_workers: Maximum number of parallel threads (None for auto-detect)
+
+        Returns:
+            List of computation results for each dataset
+
+        Usage:
+            # Basic parallel processing with automatic worker detection:
+            from phoofflineeeganalysis.PendingNotebookCode import PendingNotebookCode
+            results = PendingNotebookCode.batch_compute_all_eeg_datasets(eeg_raws=my_eeg_datasets)
+            print(f"Processed {len(results)} datasets")
+
+            # Process only the last 5 datasets using 4 workers:
+            results = PendingNotebookCode.batch_compute_all_eeg_datasets(
+                eeg_raws=my_eeg_datasets, 
+                limit_num_items=5, 
+                max_workers=4
+            )
+
+            # Performance comparison with sequential version:
+            import time
+            start = time.time()
+            par_results = PendingNotebookCode.batch_compute_all_eeg_datasets(eeg_datasets, max_workers=4)
+            par_time = time.time() - start
+            print(f"Parallel processing: {par_time:.2f}s")
+
+            # Error handling and validation:
+            results = PendingNotebookCode.batch_compute_all_eeg_datasets(eeg_datasets)
+            successful_count = sum(1 for r in results if r is not None)
+            print(f"Successfully processed {successful_count}/{len(results)} datasets")
+            failed_indices = [i for i, r in enumerate(results) if r is None]
+            if failed_indices:
+                print(f"Failed computations at indices: {failed_indices}")
+        """
+        ## INPUT: fixed_len_epochs
+        freqs = np.arange(5., 40., 1.0)
+        # Define frequencies and number of cycles
+        # freqs = np.logspace(*np.log10([2, 40]), num=20)
+        n_cycles = freqs / 2.0 # A common approach is to use a fixed number of cycles or a value that increases with frequency.
+
+        [a_raw.info.get('meas_date') for a_raw in eeg_raws]
+
+        if limit_num_items is not None:
+            limit_num_items = min(limit_num_items, len(eeg_raws))
+            active_only_out_eeg_raws = eeg_raws[-limit_num_items:] ## get only the last 3 items
+        else:
+            active_only_out_eeg_raws = eeg_raws ## get all items
+        # ## OUT: _active_only_out_eeg_raw
+        # [a_raw.info.get('meas_date') for a_raw in _active_only_out_eeg_raw]
+
+        # Determine optimal number of workers
+        if max_workers is None:
+            max_workers = min(len(active_only_out_eeg_raws), (os.cpu_count() or 4))
         
-    fig.tight_layout(pad=0)
-    plt.subplots_adjust(wspace=0, hspace=0)  # remove spacing
-    
-    if sync_to_mne_raw_fig is not None:
-        def on_mne_xlim_changed(event_ax):
-            xlim = event_ax.get_xlim()
-            ## only need to sync one because share_x=True
-            spectogram_ax = axs[0]
-            # for ax in axs:
-            spectogram_ax.set_xlim(xlim)
-            spectogram_ax.figure.canvas.draw_idle()
+        print(f"Processing {len(active_only_out_eeg_raws)} EEG datasets using {max_workers} parallel workers...")
+
+        # Parallel processing using ThreadPoolExecutor
+        active_all_outputs_dict = [None] * len(active_only_out_eeg_raws)
+        
+        def process_single_eeg(idx_raw_tuple):
+            """Process a single EEG dataset"""
+            idx, a_raw = idx_raw_tuple
+            try:
+                meas_date = a_raw.info.get('meas_date', 'Unknown')
+                print(f"  Processing dataset {idx+1}/{len(active_only_out_eeg_raws)} (meas_date: {meas_date})")
+                result = EEGComputations.run_all(raw=a_raw)
+                print(f"  Completed dataset {idx+1}/{len(active_only_out_eeg_raws)} (meas_date: {meas_date})")
+                return idx, result
+            except Exception as e:
+                print(f"  ERROR processing dataset {idx+1}: {e}")
+                return idx, None
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            future_to_idx = {
+                executor.submit(process_single_eeg, (idx, raw)): idx 
+                for idx, raw in enumerate(active_only_out_eeg_raws)
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_idx):
+                try:
+                    idx, result = future.result()
+                    active_all_outputs_dict[idx] = result
+                except Exception as e:
+                    idx = future_to_idx[future]
+                    print(f"  EXCEPTION in dataset {idx+1}: {e}")
+                    active_all_outputs_dict[idx] = None
+            ## END for future in as_completed(future_to_idx)...
+
+        print(f"Completed processing all {len(active_only_out_eeg_raws)} EEG datasets.")
+        return active_only_out_eeg_raws, active_all_outputs_dict
 
 
-        # connect to each MNE channel axis
-        # for ch_ax in mne_raw_fig.axes:  # mne_fig is your MNEBrowseFigure instance
-        #     ch_ax.callbacks.connect('xlim_changed', on_mne_xlim_changed)
+    # @function_attributes(short_name=None, tags=['xarray'], input_requires=[], output_provides=[], uses=[], used_by=[], creation_date='2025-10-01 18:55', related_items=[])
+    @classmethod
+    def build_merged(cls, active_only_out_eeg_raws, results, day_status_dict, only_include_sessions_with_status_entries: bool = True) -> Union[xr.Dataset, xr.DataArray]:
+        """ 
+        from phoofflineeeganalysis.PendingNotebookCode import PendingNotebookCode
 
-        ## only need to do one again because they're synced
-        ch_ax = sync_to_mne_raw_fig.axes[0]
-        ch_ax.callbacks.connect('xlim_changed', on_mne_xlim_changed)
-        print(f'set-up synchronization between MNE raw plot and spectogram axes')
+        cog_categorical_cats = ['cog_bad', 'cog_poor', 'cog_okay', 'cog_good', 'cog_great']
 
-    return fig, axs
+        day_status_dict = {
+            '2025-09-19/01-54-39': 'cog_poor',
+            '2025-09-18/15-23-08': 'cog_poor',
+            '2025-09-22/21-35-47': 'cog_okay',
+            '2025-09-19/20-51-18': 'cog_good',
+            '2025-09-18/03-18-42': 'cog_great',
+            '2025-09-22/21-35-47': 'cog_bad',
+            '2025-09-21/08-55-41': 'cog_bad',
+        }
 
 
-def plot_all_spectograms(_active_only_out_eeg_raw, _active_all_outputs_dict):
-    """ Plots the spectograms computed in `compute_all_eeg_comps(...)` for each raw EEG session in a separate matplotlib figure, with each channel being a separate row subplot. 
+        combined_ds, combined_da = PendingNotebookCode.build_merged(active_only_out_eeg_raws=active_only_out_eeg_raws, results=results, day_status_dict=day_status_dict)
+        combined_ds
 
-    Usage:
-        plot_all_spectograms(active_only_out_eeg_raws, results)
-    """
-    _out_figs_dict = {}
+        """
+        num_sessions: int = len(active_only_out_eeg_raws)
+        all_Sxx = []
+        data_vars = {}
+        coords = {"session": [], "cognitive_status": []}
+        for an_xdf_dataset_idx in np.arange(num_sessions):
+            a_raw = active_only_out_eeg_raws[an_xdf_dataset_idx]
+            a_meas_date = a_raw.info.get('meas_date')
+            a_raw_key: str = a_meas_date.strftime("%Y-%m-%d/%H-%M-%S") # '2025-09-22/21-35-47'
+            a_status = day_status_dict.get(a_raw_key, None)
+            if (a_status is not None) or (not only_include_sessions_with_status_entries):
+                ## a status
+                if (a_status is None):
+                    a_status = 'cog_UNLABELED' ## replace with 'cog_UNLABELED
+                    day_status_dict[a_raw_key] = a_status ## set 'cog_UNLABELED'
 
-    plt.close('all')
 
-    for idx, (a_raw, a_raw_outputs) in enumerate(zip(_active_only_out_eeg_raw, _active_all_outputs_dict)):
-        # a_path: Path = Path(a_raw.filenames[0])
-        # basename: str = a_path.stem
+                a_result = results[an_xdf_dataset_idx]
+                Sxx = a_result['spectogram']['Sxx']
+                if a_status is not None:
+                    Sxx = Sxx.assign_attrs(cognitive_status=a_status) # xarray.DataArray - channels: 14, freqs: 513, times: 1116
+
+                data_vars[a_raw_key] = Sxx
+                coords["session"].append(a_raw_key)
+                coords["cognitive_status"].append(a_status)
+
+                # Sxx ## TODO: save the xarray to a single file (as a list of xarrays for each `an_xdf_dataset_idx`
+                Sxx = Sxx.expand_dims(session=[a_raw_key])
+                all_Sxx.append(Sxx)
+        ## END for an_xdf_dataset_idx in np.arange(num_sessions)...
+        combined_da = xr.concat(all_Sxx, dim="session")
+        # Assign cognitive_status as a coordinate on session dim
+        combined_da = combined_da.assign_coords(cognitive_status=("session", list(day_status_dict.values())))
+        combined_da = combined_da.assign_attrs(cognitive_status=list(day_status_dict.values()))
+
+        combined_ds: xr.Dataset = xr.Dataset(data_vars=data_vars, coords=coords)
+        combined_ds = combined_ds.assign_attrs(cognitive_status=list(day_status_dict.values()))
+
+        return (combined_ds, combined_da)
+
+
+    @classmethod
+    def plot_session_spectogram(cls, a_raw, a_raw_outputs, sync_to_mne_raw_fig = None):
+        """ Plots the spectograms computed in `compute_all_eeg_comps(...)` for each raw EEG session in a separate matplotlib figure, with each channel being a separate row subplot. 
+
+        Usage:
+            ## Plot a synchronized EEG Raw data and Spectogram Figure together:
+            mne_raw_fig = active_only_out_eeg_raws[0].plot(time_format='datetime', scalings='auto') # MNEBrowseFigure
+            fig, axs = PendingNotebookCode.plot_session_spectogram(active_only_out_eeg_raws[0], results[0], sync_to_mne_raw_fig=mne_raw_fig)
+
+        """
+
+
         basename: str = a_raw.info.get('meas_date')
-        fig_identifier: str = f'spectrogram_all_channels[{idx}]: {basename}'
+        fig_identifier: str = f'spectrogram_all_channels[{basename}]'
 
-        fig, axs = plt.subplots(nrows=len(a_raw.info.ch_names), ncols=2, num=fig_identifier,
-                                sharey='row', width_ratios=[12, 1])
-        _out_figs_dict[fig_identifier] = {'fig': fig, 'axs': axs}
+        fig, axs = plt.subplots(nrows=len(a_raw.info.ch_names), ncols=1, num='spectrogram_all_channels', sharey=True, sharex=True, clear=True)
 
-        spectogram_result_dict =a_raw_outputs['spectogram']['spectogram_result_dict']
-        fs =a_raw_outputs['spectogram']['fs']
+        spectogram_result_dict = a_raw_outputs['spectogram']['spectogram_result_dict']
+        fs = a_raw_outputs['spectogram']['fs']
 
         for ch_idx, (a_ch, a_ch_spect_result_tuple) in enumerate(spectogram_result_dict.items()):
             f, t, Sxx = a_ch_spect_result_tuple
-            an_ax = axs[ch_idx][0]
-            v =  10*np.log10(Sxx+1e-12)
-            an_ax.pcolormesh(t, f, v, shading='auto')
+            an_ax = axs[ch_idx]
+            an_ax.pcolormesh(t, f, 10*np.log10(Sxx+1e-12), shading='auto')
             # plt.pcolormesh(t, f, 10*np.log10(Sxx+1e-12), shading='auto', ax=an_ax)
-            plt.ylim([1, 40])
+            # an_ax.ylims([1, 40])
+            # ch_label: str = f"{a_ch}[{ch_idx}]"
+            ch_label: str = f"{a_ch}"
             # plt.ylabel(f"{a_ch}[{ch_idx}]", ax=an_ax)
-            an_ax.set_ylabel(f"{a_ch}[{ch_idx}]")
+            an_ax.set_ylabel(ch_label)
+        ## END for ch_idx, (a_ch, a_ch_spect_result_tuple) in enumerate(spectogram_result_dict.items())...
+            
+        fig.tight_layout(pad=0)
+        plt.subplots_adjust(wspace=0, hspace=0)  # remove spacing
+        
+        if sync_to_mne_raw_fig is not None:
+            def on_mne_xlim_changed(event_ax):
+                xlim = event_ax.get_xlim()
+                ## only need to sync one because share_x=True
+                spectogram_ax = axs[0]
+                # for ax in axs:
+                spectogram_ax.set_xlim(xlim)
+                spectogram_ax.figure.canvas.draw_idle()
 
-            a_summary_ax = axs[ch_idx][1]
-            summary_v = np.atleast_2d(np.nansum(v, axis=0))
-            a_summary_ax.imshow(summary_v)        
-            # a_summary_ax.pcolormesh([0.0, 1.0], f, summary_v, shading='auto')
+
+            # connect to each MNE channel axis
+            # for ch_ax in mne_raw_fig.axes:  # mne_fig is your MNEBrowseFigure instance
+            #     ch_ax.callbacks.connect('xlim_changed', on_mne_xlim_changed)
+
+            ## only need to do one again because they're synced
+            ch_ax = sync_to_mne_raw_fig.axes[0]
+            ch_ax.callbacks.connect('xlim_changed', on_mne_xlim_changed)
+            print(f'set-up synchronization between MNE raw plot and spectogram axes')
+
+        return fig, axs
 
 
+    @classmethod
+    def plot_all_spectograms(cls, _active_only_out_eeg_raw, _active_all_outputs_dict):
+        """ Plots the spectograms computed in `compute_all_eeg_comps(...)` for each raw EEG session in a separate matplotlib figure, with each channel being a separate row subplot. 
 
-def render_all_spectograms_to_high_quality_pdfs(
-    _active_only_out_eeg_raw,
-    _active_all_outputs_dict,
-    output_parent_folder: Optional[Path] = None,
-    mode: str = "paged",
-    seconds_per_page: float = 120.0,
-    freq_min_hz: float = 1.0,
-    freq_max_hz: float = 40.0,
-    cmap: str = "viridis",
-    dpi: int = 300,
-    include_channel_summary: bool = True,
-    page_size_inches: Tuple[float, float] = (14.0, 8.5),
-    tight_layout: bool = True,
-    annotate_file_info: bool = True,
-    debug_print: bool = False,
-):
-    """ Known not to work.
-    Render spectrograms for each EEG recording into high-quality PDFs suitable for tablet viewing.
+        Usage:
+            PendingNotebookCode.plot_all_spectograms(active_only_out_eeg_raws, results)
+        """
+        _out_figs_dict = {}
 
-    Produces either:
-    - Paged PDFs (default): Each page covers a time window (seconds_per_page) with all channels stacked.
-    - Long single-page PDFs (mode="long"): Horizontal layouts can be very large; use with caution for filesize/performance.
+        plt.close('all')
 
-    Args:
-        _active_only_out_eeg_raw: List of mne.io.Raw for the EEG sessions rendered in order
-        _active_all_outputs_dict: List of per-session results from compute_all_eeg_comps, each containing spectrogram outputs
-        output_parent_folder: Parent folder to write PDFs (default: <cwd>/spectrogram_exports/yyyy-mm-dd)
-        mode: "paged" (default) or "long"
-        seconds_per_page: Window length per page when in paged mode
-        freq_min_hz: Minimum frequency rendered
-        freq_max_hz: Maximum frequency rendered
-        cmap: Matplotlib colormap name
-        dpi: Render DPI for figures
-        include_channel_summary: If True, add a thin side panel per channel with the time-collapsed energy
-        page_size_inches: Tuple(width, height) in inches
-        tight_layout: If True, call tight_layout() per page
-        annotate_file_info: If True, add filename, meas_date, timezone, and time range to headers
-        debug_print: Verbose printing
+        for idx, (a_raw, a_raw_outputs) in enumerate(zip(_active_only_out_eeg_raw, _active_all_outputs_dict)):
+            # a_path: Path = Path(a_raw.filenames[0])
+            # basename: str = a_path.stem
+            basename: str = a_raw.info.get('meas_date')
+            fig_identifier: str = f'spectrogram_all_channels[{idx}]: {basename}'
 
-    Returns:
-        List[Path]: Paths to written PDF files (one per session)
+            fig, axs = plt.subplots(nrows=len(a_raw.info.ch_names), ncols=2, num=fig_identifier,
+                                    sharey='row', width_ratios=[12, 1])
+            _out_figs_dict[fig_identifier] = {'fig': fig, 'axs': axs}
 
-    Usage:
-        # Compute results first
-        active_only_out_eeg_raws, results = compute_all_eeg_comps(eeg_raws=my_eeg_datasets, limit_num_items=3)
+            spectogram_result_dict =a_raw_outputs['spectogram']['spectogram_result_dict']
+            fs =a_raw_outputs['spectogram']['fs']
 
-        # Render to PDFs (paged)
-        from pathlib import Path
-        out_paths = render_all_spectograms_to_high_quality_pdfs(
-            active_only_out_eeg_raws,
-            results,
-            output_parent_folder=Path(r"E:/Dropbox (Personal)/Databases/AnalysisData/MNE_preprocessed/exports"),
-            mode="paged",
-            seconds_per_page=180.0,
-            freq_min_hz=1.0,
-            freq_max_hz=40.0,
-            dpi=300
-        )
-        print(f"Wrote {len(out_paths)} PDF(s)")
+            for ch_idx, (a_ch, a_ch_spect_result_tuple) in enumerate(spectogram_result_dict.items()):
+                f, t, Sxx = a_ch_spect_result_tuple
+                an_ax = axs[ch_idx][0]
+                v =  10*np.log10(Sxx+1e-12)
+                an_ax.pcolormesh(t, f, v, shading='auto')
+                # plt.pcolormesh(t, f, 10*np.log10(Sxx+1e-12), shading='auto', ax=an_ax)
+                plt.ylim([1, 40])
+                # plt.ylabel(f"{a_ch}[{ch_idx}]", ax=an_ax)
+                an_ax.set_ylabel(f"{a_ch}[{ch_idx}]")
 
-        # Render as a single long page (may produce large files)
-        out_paths_long = render_all_spectograms_to_high_quality_pdfs(
-            active_only_out_eeg_raws,
-            results,
-            mode="long",
-            seconds_per_page=0,  # ignored in long mode
-        )
+                a_summary_ax = axs[ch_idx][1]
+                summary_v = np.atleast_2d(np.nansum(v, axis=0))
+                a_summary_ax.imshow(summary_v)        
+                # a_summary_ax.pcolormesh([0.0, 1.0], f, summary_v, shading='auto')
+            ## END for ch_idx, (a_ch, a_ch_spect_result_tuple) in enumerate(spectogram_result_dict.items())...
+        ## END for idx, (a_raw, a_raw_outputs) in enumerate(zip(_active_only_out_eeg_raw, _active_all_outputs_dict))...
 
-    """
-    if output_parent_folder is None:
-        today = datetime.now().strftime("%Y-%m-%d")
-        output_parent_folder = Path.cwd().joinpath("spectrogram_exports", today)
-    output_parent_folder.mkdir(parents=True, exist_ok=True)
 
-    written_paths: List[Path] = []
+    @classmethod
+    def render_all_spectograms_to_high_quality_pdfs(cls, _active_only_out_eeg_raw, _active_all_outputs_dict, output_parent_folder: Optional[Path] = None, mode: str = "paged", seconds_per_page: float = 120.0, freq_min_hz: float = 1.0, freq_max_hz: float = 40.0, cmap: str = "viridis", dpi: int = 300, include_channel_summary: bool = True, page_size_inches: Tuple[float, float] = (14.0, 8.5), tight_layout: bool = True, annotate_file_info: bool = True, debug_print: bool = False):
+        """ Known not to work.
+        Render spectrograms for each EEG recording into high-quality PDFs suitable for tablet viewing.
 
-    for idx, (a_raw, a_raw_outputs) in enumerate(zip(_active_only_out_eeg_raw, _active_all_outputs_dict)):
-        if a_raw_outputs is None:
-            if debug_print:
-                print(f"Skipping idx {idx}: no outputs present")
-            continue
+        Produces either:
+        - Paged PDFs (default): Each page covers a time window (seconds_per_page) with all channels stacked.
+        - Long single-page PDFs (mode="long"): Horizontal layouts can be very large; use with caution for filesize/performance.
 
-        spectogram_result_dict = a_raw_outputs.get('spectogram', {}).get('spectogram_result_dict', None)
-        fs = a_raw_outputs.get('spectogram', {}).get('fs', None)
-        if (spectogram_result_dict is None) or (fs is None):
-            if debug_print:
-                print(f"Skipping idx {idx}: spectrogram results missing")
-            continue
+        Args:
+            _active_only_out_eeg_raw: List of mne.io.Raw for the EEG sessions rendered in order
+            _active_all_outputs_dict: List of per-session results from compute_all_eeg_comps, each containing spectrogram outputs
+            output_parent_folder: Parent folder to write PDFs (default: <cwd>/spectrogram_exports/yyyy-mm-dd)
+            mode: "paged" (default) or "long"
+            seconds_per_page: Window length per page when in paged mode
+            freq_min_hz: Minimum frequency rendered
+            freq_max_hz: Maximum frequency rendered
+            cmap: Matplotlib colormap name
+            dpi: Render DPI for figures
+            include_channel_summary: If True, add a thin side panel per channel with the time-collapsed energy
+            page_size_inches: Tuple(width, height) in inches
+            tight_layout: If True, call tight_layout() per page
+            annotate_file_info: If True, add filename, meas_date, timezone, and time range to headers
+            debug_print: Verbose printing
 
-        # Build session identifiers
-        try:
-            src_file_path: Optional[Path] = None
-            description_val = a_raw.info.get('description', None)
-            if description_val is not None:
-                try:
-                    src_file_path = Path(description_val)
-                except Exception:
-                    src_file_path = None
-            basename: str = src_file_path.stem if (src_file_path is not None and src_file_path.exists()) else f"EEG_{idx:03d}"
-        except Exception:
-            basename = f"EEG_{idx:03d}"
+        Returns:
+            List[Path]: Paths to written PDF files (one per session)
 
-        meas_date = a_raw.info.get('meas_date', None)
-        tz = None
-        if isinstance(meas_date, datetime):
-            tz = meas_date.tzinfo or timezone.utc
-        # Fallbacks
-        safe_meas_date_str = str(meas_date) if isinstance(meas_date, datetime) else "Unknown"
+        Usage:
+            # Compute results first
+            active_only_out_eeg_raws, results = compute_all_eeg_comps(eeg_raws=my_eeg_datasets, limit_num_items=3)
 
-        # Create output path per session
-        out_pdf_path: Path = output_parent_folder.joinpath(f"{basename}_spectrogram.pdf")
+            # Render to PDFs (paged)
+            from pathlib import Path
+            from phoofflineeeganalysis.PendingNotebookCode import PendingNotebookCode
+            out_paths = PendingNotebookCode.render_all_spectograms_to_high_quality_pdfs(
+                active_only_out_eeg_raws,
+                results,
+                output_parent_folder=Path(r"E:/Dropbox (Personal)/Databases/AnalysisData/MNE_preprocessed/exports"),
+                mode="paged",
+                seconds_per_page=180.0,
+                freq_min_hz=1.0,
+                freq_max_hz=40.0,
+                dpi=300
+            )
+            print(f"Wrote {len(out_paths)} PDF(s)")
 
-        # Build time axis from one channel's spectrogram (assume consistent t across channels)
-        # Choose the first entry deterministically
-        first_key = next(iter(spectogram_result_dict.keys()))
-        f_base, t_base, Sxx_base = spectogram_result_dict[first_key]
+            # Render as a single long page (may produce large files)
+            out_paths_long = PendingNotebookCode.render_all_spectograms_to_high_quality_pdfs(
+                active_only_out_eeg_raws,
+                results,
+                mode="long",
+                seconds_per_page=0,  # ignored in long mode
+            )
 
-        # Frequency mask
-        f_mask = (f_base >= float(freq_min_hz)) & (f_base <= float(freq_max_hz))
-        f_plot = f_base[f_mask]
+        """
+        if output_parent_folder is None:
+            today = datetime.now().strftime("%Y-%m-%d")
+            output_parent_folder = Path.cwd().joinpath("spectrogram_exports", today)
+        output_parent_folder.mkdir(parents=True, exist_ok=True)
 
-        # Map samples to absolute times if meas_date is available
-        def format_time_label(seconds_since_start: float) -> str:
+        written_paths: List[Path] = []
+
+        for idx, (a_raw, a_raw_outputs) in enumerate(zip(_active_only_out_eeg_raw, _active_all_outputs_dict)):
+            if a_raw_outputs is None:
+                if debug_print:
+                    print(f"Skipping idx {idx}: no outputs present")
+                continue
+
+            spectogram_result_dict = a_raw_outputs.get('spectogram', {}).get('spectogram_result_dict', None)
+            fs = a_raw_outputs.get('spectogram', {}).get('fs', None)
+            if (spectogram_result_dict is None) or (fs is None):
+                if debug_print:
+                    print(f"Skipping idx {idx}: spectrogram results missing")
+                continue
+
+            # Build session identifiers
+            try:
+                src_file_path: Optional[Path] = None
+                description_val = a_raw.info.get('description', None)
+                if description_val is not None:
+                    try:
+                        src_file_path = Path(description_val)
+                    except Exception:
+                        src_file_path = None
+                basename: str = src_file_path.stem if (src_file_path is not None and src_file_path.exists()) else f"EEG_{idx:03d}"
+            except Exception:
+                basename = f"EEG_{idx:03d}"
+
+            meas_date = a_raw.info.get('meas_date', None)
+            tz = None
             if isinstance(meas_date, datetime):
-                actual_ts = meas_date + timedelta(seconds=float(seconds_since_start))
-                return actual_ts.astimezone(tz or timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
+                tz = meas_date.tzinfo or timezone.utc
+            # Fallbacks
+            safe_meas_date_str = str(meas_date) if isinstance(meas_date, datetime) else "Unknown"
+
+            # Create output path per session
+            out_pdf_path: Path = output_parent_folder.joinpath(f"{basename}_spectrogram.pdf")
+
+            # Build time axis from one channel's spectrogram (assume consistent t across channels)
+            # Choose the first entry deterministically
+            first_key = next(iter(spectogram_result_dict.keys()))
+            f_base, t_base, Sxx_base = spectogram_result_dict[first_key]
+
+            # Frequency mask
+            f_mask = (f_base >= float(freq_min_hz)) & (f_base <= float(freq_max_hz))
+            f_plot = f_base[f_mask]
+
+            # Map samples to absolute times if meas_date is available
+            def format_time_label(seconds_since_start: float) -> str:
+                if isinstance(meas_date, datetime):
+                    actual_ts = meas_date + timedelta(seconds=float(seconds_since_start))
+                    return actual_ts.astimezone(tz or timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
+                else:
+                    return f"t+{seconds_since_start:.2f}s"
+
+            # Determine paging
+            total_duration_s = float(t_base[-1] - t_base[0]) if len(t_base) > 1 else float(t_base[-1])
+            if mode.lower() == "paged":
+                if seconds_per_page is None or seconds_per_page <= 0:
+                    seconds_per_page = 120.0
+                num_pages = max(1, int(np.ceil(total_duration_s / float(seconds_per_page))))
             else:
-                return f"t+{seconds_since_start:.2f}s"
+                num_pages = 1  # long
 
-        # Determine paging
-        total_duration_s = float(t_base[-1] - t_base[0]) if len(t_base) > 1 else float(t_base[-1])
-        if mode.lower() == "paged":
-            if seconds_per_page is None or seconds_per_page <= 0:
-                seconds_per_page = 120.0
-            num_pages = max(1, int(np.ceil(total_duration_s / float(seconds_per_page))))
-        else:
-            num_pages = 1  # long
+            if debug_print:
+                print(f"Session {idx}: basename={basename}, duration={total_duration_s:.2f}s, pages={num_pages}, mode={mode}")
 
-        if debug_print:
-            print(f"Session {idx}: basename={basename}, duration={total_duration_s:.2f}s, pages={num_pages}, mode={mode}")
-
-        with PdfPages(out_pdf_path.as_posix()) as pdf:
-            for page_idx in range(num_pages):
-                # Page bounds in seconds (relative to start of t_base)
-                if mode.lower() == "paged":
-                    start_s = page_idx * seconds_per_page
-                    end_s = min(total_duration_s, (page_idx + 1) * seconds_per_page)
-                else:  # long
-                    start_s = 0.0
-                    end_s = total_duration_s
-
-                # Time mask for current page
-                t_mask = (t_base >= (t_base[0] + start_s)) & (t_base <= (t_base[0] + end_s))
-                t_plot = t_base[t_mask] - t_base[0]  # normalize to 0 at start of session
-
-                # Prepare figure
-                n_channels = len(spectogram_result_dict)
-                ncols = 2 if include_channel_summary else 1
-                width_ratios = [12, 1] if include_channel_summary else [1]
-
-                fig = plt.figure(figsize=page_size_inches, dpi=dpi)
-                axs = fig.subplots(nrows=n_channels, ncols=ncols, sharey='row', width_ratios=width_ratios)
-                if n_channels == 1:
-                    axs = np.atleast_2d(axs)  # unify indexing
-
-                # Header text (file info)
-                if annotate_file_info:
-                    header_lines = [f"Session: {basename}"]
-                    header_lines.append(f"Measured: {safe_meas_date_str}")
+            with PdfPages(out_pdf_path.as_posix()) as pdf:
+                for page_idx in range(num_pages):
+                    # Page bounds in seconds (relative to start of t_base)
                     if mode.lower() == "paged":
-                        header_lines.append(f"Page {page_idx+1}/{num_pages}, Window: {format_time_label(start_s)} → {format_time_label(end_s)}")
-                    else:
-                        header_lines.append(f"Full Duration: 0.00s → {total_duration_s:.2f}s")
-                    fig.suptitle(" | ".join(header_lines), fontsize=12)
+                        start_s = page_idx * seconds_per_page
+                        end_s = min(total_duration_s, (page_idx + 1) * seconds_per_page)
+                    else:  # long
+                        start_s = 0.0
+                        end_s = total_duration_s
 
-                # Render each channel
-                for ch_row_idx, (a_ch, a_ch_spect_result_tuple) in enumerate(spectogram_result_dict.items()):
-                    f, t, Sxx = a_ch_spect_result_tuple
-                    # Apply masks
-                    f_m = (f >= float(freq_min_hz)) & (f <= float(freq_max_hz))
-                    f_use = f[f_m]
-                    t_m = (t >= (t_base[0] + start_s)) & (t <= (t_base[0] + end_s))
-                    t_use = t[t_m] - t_base[0]
-                    S = Sxx[f_m][:, t_m]
+                    # Time mask for current page
+                    t_mask = (t_base >= (t_base[0] + start_s)) & (t_base <= (t_base[0] + end_s))
+                    t_plot = t_base[t_mask] - t_base[0]  # normalize to 0 at start of session
 
-                    power_db = 10.0 * np.log10(S + 1e-12)
+                    # Prepare figure
+                    n_channels = len(spectogram_result_dict)
+                    ncols = 2 if include_channel_summary else 1
+                    width_ratios = [12, 1] if include_channel_summary else [1]
 
-                    ax_main = axs[ch_row_idx][0] if include_channel_summary else axs[ch_row_idx]
-                    mesh = ax_main.pcolormesh(t_use, f_use, power_db, shading='auto', cmap=cmap)
-                    ax_main.set_ylim([float(freq_min_hz), float(freq_max_hz)])
-                    ax_main.set_ylabel(f"{a_ch}")
-                    if ch_row_idx == n_channels - 1:
-                        # Label times only on the last channel row to save space
-                        ax_main.set_xlabel("Time (s)")
-                    # Convert a few tick labels to human readable times if possible
-                    if isinstance(meas_date, datetime):
-                        xticks = ax_main.get_xticks()
-                        ax_main.set_xticklabels([format_time_label(float(x)) for x in xticks], rotation=0, fontsize=8)
+                    fig = plt.figure(figsize=page_size_inches, dpi=dpi)
+                    axs = fig.subplots(nrows=n_channels, ncols=ncols, sharey='row', width_ratios=width_ratios)
+                    if n_channels == 1:
+                        axs = np.atleast_2d(axs)  # unify indexing
 
-                    # Optional summary side panel
-                    if include_channel_summary:
-                        ax_side = axs[ch_row_idx][1]
-                        # collapse across frequency (sum of power over freq per time)
-                        summary_v = np.atleast_2d(np.nansum(power_db, axis=0))
-                        ax_side.imshow(summary_v, aspect='auto', cmap=cmap)
-                        ax_side.set_xticks([])
-                        ax_side.set_yticks([])
+                    # Header text (file info)
+                    if annotate_file_info:
+                        header_lines = [f"Session: {basename}"]
+                        header_lines.append(f"Measured: {safe_meas_date_str}")
+                        if mode.lower() == "paged":
+                            header_lines.append(f"Page {page_idx+1}/{num_pages}, Window: {format_time_label(start_s)} → {format_time_label(end_s)}")
+                        else:
+                            header_lines.append(f"Full Duration: 0.00s → {total_duration_s:.2f}s")
+                        fig.suptitle(" | ".join(header_lines), fontsize=12)
 
-                # Colorbar for the last axis
-                cbar = fig.colorbar(mesh, ax=axs.ravel().tolist(), shrink=0.98, pad=0.01)
-                cbar.set_label('Power (dB)')
+                    # Render each channel
+                    for ch_row_idx, (a_ch, a_ch_spect_result_tuple) in enumerate(spectogram_result_dict.items()):
+                        f, t, Sxx = a_ch_spect_result_tuple
+                        # Apply masks
+                        f_m = (f >= float(freq_min_hz)) & (f <= float(freq_max_hz))
+                        f_use = f[f_m]
+                        t_m = (t >= (t_base[0] + start_s)) & (t <= (t_base[0] + end_s))
+                        t_use = t[t_m] - t_base[0]
+                        S = Sxx[f_m][:, t_m]
 
-                # if tight_layout:
-                #     plt.tight_layout(rect=[0, 0, 1, 0.95] if annotate_file_info else None)
+                        power_db = 10.0 * np.log10(S + 1e-12)
 
-                pdf.savefig(fig)
-                plt.close(fig)
+                        ax_main = axs[ch_row_idx][0] if include_channel_summary else axs[ch_row_idx]
+                        mesh = ax_main.pcolormesh(t_use, f_use, power_db, shading='auto', cmap=cmap)
+                        ax_main.set_ylim([float(freq_min_hz), float(freq_max_hz)])
+                        ax_main.set_ylabel(f"{a_ch}")
+                        if ch_row_idx == n_channels - 1:
+                            # Label times only on the last channel row to save space
+                            ax_main.set_xlabel("Time (s)")
+                        # Convert a few tick labels to human readable times if possible
+                        if isinstance(meas_date, datetime):
+                            xticks = ax_main.get_xticks()
+                            ax_main.set_xticklabels([format_time_label(float(x)) for x in xticks], rotation=0, fontsize=8)
 
-        written_paths.append(out_pdf_path)
-        if debug_print:
-            print(f"Wrote: {out_pdf_path.as_posix()}")
+                        # Optional summary side panel
+                        if include_channel_summary:
+                            ax_side = axs[ch_row_idx][1]
+                            # collapse across frequency (sum of power over freq per time)
+                            summary_v = np.atleast_2d(np.nansum(power_db, axis=0))
+                            ax_side.imshow(summary_v, aspect='auto', cmap=cmap)
+                            ax_side.set_xticks([])
+                            ax_side.set_yticks([])
+                    ## END for ch_row_idx, (a_ch, a_ch_spect_result_tuple) in enumerate(spectogram_result_dict.items())...
 
-    return written_paths
+                    # Colorbar for the last axis
+                    cbar = fig.colorbar(mesh, ax=axs.ravel().tolist(), shrink=0.98, pad=0.01)
+                    cbar.set_label('Power (dB)')
+
+                    # if tight_layout:
+                    #     plt.tight_layout(rect=[0, 0, 1, 0.95] if annotate_file_info else None)
+
+                    pdf.savefig(fig)
+                    plt.close(fig)
+                ## END for page_idx in range(num_pages)...
+
+            written_paths.append(out_pdf_path)
+            if debug_print:
+                print(f"Wrote: {out_pdf_path.as_posix()}")
+        ## END for idx, (a_raw, a_raw_outputs) in enumerate(zip(_active_only_out_eeg_raw, _active_all_outputs_dict))...
+
+        return written_paths
