@@ -372,18 +372,19 @@ class SpectrogramApp(param.Parameterized):
         return layout
 
 
-# Factory function to create and return a Panel app
-def make_app(ds: xr.Dataset, channels_to_select=None):
-    """
-    Create the SpectrogramApp instance and return the Panel layout (call .show() or serve).
-    Example:
-        from phoofflineeeganalysis.analysis.UI.spectrogram_gui import make_app
+    # Factory function to create and return a Panel app
+    @classmethod
+    def make_app(cls, ds: xr.Dataset, channels_to_select=None):
+        """
+        Create the SpectrogramApp instance and return the Panel layout (call .show() or serve).
+        Example:
+            from phoofflineeeganalysis.analysis.UI.spectrogram_gui import SpectrogramApp
 
-        app = make_app(ds_disk, channels_to_select=['AF3','F7','F3','FC5'])
-        pn.serve(app, show=True)   # if using programmatic server
-    """
-    app = SpectrogramApp(ds=ds, channels_to_select=channels_to_select or ['AF3','F7','F3','FC5'])
-    return app.panel()
+            app = SpectrogramApp.make_app(ds_disk, channels_to_select=['AF3','F7','F3','FC5'])
+            pn.serve(app, show=True)   # if using programmatic server
+        """
+        app = SpectrogramApp(ds=ds, channels_to_select=channels_to_select or ['AF3','F7','F3','FC5'])
+        return app.panel()
 
 
 # If run with `panel serve spectrogram_gui.py` Panel will look for `pn` at the module level.
@@ -399,7 +400,7 @@ def _get_default_panel():
             return pn.Column(pn.pane.Markdown("No dataset `ds_disk` found in module globals. "
                                              "Please create the app programmatically with `make_app(ds)`"))
         else:
-            return make_app(ds, channels_to_select=['AF3','F7','F3','FC5'])
+            return SpectrogramApp.make_app(ds, channels_to_select=['AF3','F7','F3','FC5'])
     except Exception:
         return pn.Column(pn.pane.Markdown("Error while creating default app. Use `make_app(ds)`."))
 

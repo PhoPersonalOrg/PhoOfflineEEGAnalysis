@@ -32,3 +32,4 @@ forecasting
 examples_jupyter/EXTERNAL
 .vscode/groupbookmarks
 **/exploded-call-hierarchy.ipynb
+.cursor/chats

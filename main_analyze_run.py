@@ -29,12 +29,10 @@ import panel as pn
 # IPython imports
 
 # Project-specific imports
-from phopymnehelper.MNE_helpers import (
-	up_convert_raw_objects, up_convert_raw_obj
-)
+from phopymnehelper.MNE_helpers import MNEHelpers
 from phopymnehelper.EEG_data import EEGComputations, EEGData
 from phopymnehelper.analysis.computations.cache import DiskComputationCache
-from phopymnehelper.analysis.computations.eeg_registry import run_eeg_graph_legacy_ordered, session_fingerprint_for_raw_or_path
+from phopymnehelper.analysis.computations.eeg_registry import EEGComputationRegistryHelper
 from phopymnehelper.SavedSessionsProcessor import SavedSessionsProcessor, DataModalityType
 from phopymnehelper.xdf_files import LabRecorderXDF, XDFDataStreamAccessor
 
@@ -47,240 +45,10 @@ def _reset_stream_infos_index_for_groupby(stream_infos_df: pd.DataFrame) -> pd.D
 	if sidf.index.name == 'xdf_dataset_idx' and 'xdf_dataset_idx' in sidf.columns:
 		sidf = sidf.drop(columns=['xdf_dataset_idx'])
 	return sidf.reset_index()
+# Computation cache handling is managed via phopymnehelper.analysis.computations.DiskComputationCache and BatchSessionExecutor.
 
 
-@define(slots=False)
-class ComputationCacheManager:
-	cache_root: Path = field(converter=Path)
-	history_columns: List[str] = field(factory=lambda: list(COMPUTATION_HISTORY_COLUMNS))
-	history_df: pd.DataFrame = field(init=False)
-	history_lock: threading.Lock = field(factory=threading.Lock)
 
-
-	def __attrs_post_init__(self):
-		self.cache_root = Path(self.cache_root)
-		if not self.history_path.exists():
-			self.history_df = pd.DataFrame(columns=self.history_columns)
-			return
-		try:
-			df = pd.read_csv(self.history_path)
-			if list(df.columns) != self.history_columns:
-				self.history_df = pd.DataFrame(columns=self.history_columns)
-				return
-			self.history_df = df
-		except Exception:
-			self.history_df = pd.DataFrame(columns=self.history_columns)
-
-
-	@property
-	def history_path(self) -> Path:
-		return self.cache_root / "computation_history.csv"
-
-
-	def compute_key(self, xdf_path: Path, params: Dict[str, Any], mtime: Optional[float] = None) -> str:
-		"""Compute a deterministic cache key from XDF path and run_all params; optionally include mtime for invalidation when file changes. Returns 16-char hex digest."""
-		canonical_path = str(Path(xdf_path).resolve())
-		params_json = json.dumps(params, sort_keys=True)
-		payload = f"{canonical_path}|{mtime}|{params_json}" if mtime is not None else f"{canonical_path}|{params_json}"
-		return hashlib.sha256(payload.encode()).hexdigest()[:16]
-
-
-	def _row_to_result(self, row: pd.Series) -> Optional[Tuple[Path, Optional[str]]]:
-		result_path = Path(row["result_path"])
-		if not result_path.is_absolute():
-			result_path = (self.cache_root / result_path).resolve()
-		if not result_path.exists():
-			return None
-		fif_filename = row.get("fif_filename")
-		if pd.isna(fif_filename) or fif_filename == "":
-			fif_filename = None
-		else:
-			fif_filename = str(fif_filename)
-		return (result_path, fif_filename)
-
-
-	def lookup(self, cache_key_hex: str, xdf_path: Optional[Path] = None) -> Optional[Tuple[Path, Optional[str]]]:
-		"""If key is in history and result blob exists, return (result_path, fif_filename); else None. If xdf_path is given and key lookup misses, try matching by canonical path so entries stored with mtime in the key still hit."""
-		if self.history_df is None or self.history_df.empty:
-			return None
-		rows = self.history_df.loc[self.history_df["cache_key_hex"] == cache_key_hex]
-		if not rows.empty:
-			out = self._row_to_result(rows.iloc[0])
-			if out is not None:
-				return out
-		if xdf_path is None:
-			return None
-		canonical = str(Path(xdf_path).resolve())
-		path_match = self.history_df.loc[self.history_df["xdf_path"].astype(str).str.strip() == canonical]
-		if path_match.empty:
-			return None
-		return self._row_to_result(path_match.iloc[0])
-
-
-	def load_result(self, result_path: Path) -> dict:
-		"""Load a serialized result dict from a pickle blob."""
-		with open(result_path, "rb") as f:
-			return pickle.load(f)
-
-
-	def save_result(self, cache_key_hex: str, result: dict, xdf_path: Path, mtime: float, params: Dict[str, Any], fif_filename: Optional[str]) -> None:
-		"""Write result blob and append one row to the computation history CSV (thread-safe)."""
-		self.cache_root.mkdir(parents=True, exist_ok=True)
-		result_path = self.cache_root / f"{cache_key_hex}.pkl"
-		with open(result_path, "wb") as f:
-			pickle.dump(result, f)
-		print(f"  Cache save: wrote result to {result_path.resolve().as_posix()}")
-		params_json = json.dumps(params, sort_keys=True)
-		xdf_path_str = str(Path(xdf_path).resolve())
-		result_path_str = str(result_path.resolve())
-		fif_str = fif_filename if fif_filename else ""
-		computed_at = datetime.now(timezone.utc).isoformat()
-		new_row = pd.DataFrame([{"cache_key_hex": cache_key_hex, "xdf_path": xdf_path_str, "xdf_mtime": mtime, "params_json": params_json, "result_path": result_path_str, "fif_filename": fif_str, "computed_at": computed_at}])
-		with self.history_lock:
-			if self.history_path.exists():
-				new_row.to_csv(self.history_path, mode="a", header=False, index=False)
-			else:
-				new_row.to_csv(self.history_path, mode="w", header=True, index=False)
-
-
-def compute_session_summary_metrics(active_only_out_eeg_raws, results, stream_infos_df: Optional[pd.DataFrame], output_folder: Path, freq_min: float = 1.0, freq_max: float = 40.0, filename_prefix: str = "") -> Path:
-	"""
-	Compute simple per-session summary metrics from the spectrogram outputs and save to CSV.
-
-	Metrics are intended to support quick comparison across sessions and include:
-	  - Duration, sampling rate, number of channels
-	  - Bandpower (absolute and relative) for classical bands (delta/theta/alpha/beta)
-	  - Dominant frequency within [freq_min, freq_max]
-
-	Returns:
-		Path to the created CSV file.
-	"""
-	output_folder = Path(output_folder)
-	output_folder.mkdir(parents=True, exist_ok=True)
-
-	rows = []
-
-	# Precompute simple lookup from dataset index -> xdf_filename (if available)
-	dataset_to_filename: Dict[int, str] = {}
-	if stream_infos_df is not None:
-		try:
-			tmp_df = _reset_stream_infos_index_for_groupby(stream_infos_df)
-			if "xdf_dataset_idx" in tmp_df.columns and "xdf_filename" in tmp_df.columns:
-				for ds_idx, grp in tmp_df.groupby("xdf_dataset_idx"):
-					# Use the first filename for this dataset index
-					dataset_to_filename[int(ds_idx)] = str(grp["xdf_filename"].iloc[0])
-		except Exception as e:
-			print(f"  WARN: failed to derive dataset -> filename mapping: {e}")
-
-	def _band_mean(Sxx_vals: np.ndarray, freqs_vals: np.ndarray, low: float, high: float) -> float:
-		band_mask = (freqs_vals >= low) & (freqs_vals < high)
-		if not np.any(band_mask):
-			return float("nan")
-		return float(np.nanmean(Sxx_vals[:, band_mask]))
-
-	for idx, (a_raw, a_result) in enumerate(zip(active_only_out_eeg_raws, results)):
-		if a_result is None:
-			continue
-		if "spectogram" not in a_result:
-			continue
-
-		try:
-			spect_dict = a_result["spectogram"]
-			Sxx_avg = spect_dict["Sxx_avg"]  # xarray.DataArray: (channels, freqs)
-			freqs_vals = np.asarray(Sxx_avg.coords["freqs"])
-			Sxx_vals = np.asarray(Sxx_avg)  # (n_channels, n_freqs)
-		except Exception as e:
-			print(f"  WARN: failed to unpack spectrogram for session {idx}: {e}")
-			continue
-
-		# Restrict to the main comparison band for global metrics
-		main_band_mask = (freqs_vals >= freq_min) & (freqs_vals <= freq_max)
-		if not np.any(main_band_mask):
-			print(f"  WARN: no frequencies within [{freq_min}, {freq_max}] Hz for session {idx}")
-			continue
-
-		Sxx_main = Sxx_vals[:, main_band_mask]
-		freqs_main = freqs_vals[main_band_mask]
-
-		# Total power in [freq_min, freq_max]
-		total_power = float(np.nanmean(Sxx_main))
-
-		# Classical bands
-		delta_power = _band_mean(Sxx_vals, freqs_vals, 1.0, 4.0)
-		theta_power = _band_mean(Sxx_vals, freqs_vals, 4.0, 8.0)
-		alpha_power = _band_mean(Sxx_vals, freqs_vals, 8.0, 13.0)
-		beta_power = _band_mean(Sxx_vals, freqs_vals, 13.0, 30.0)
-
-		# Relative powers and simple ratios
-		def _safe_div(n: float, d: float) -> float:
-			return float(n / d) if np.isfinite(n) and np.isfinite(d) and d != 0 else float("nan")
-
-		delta_rel = _safe_div(delta_power, total_power)
-		theta_rel = _safe_div(theta_power, total_power)
-		alpha_rel = _safe_div(alpha_power, total_power)
-		beta_rel = _safe_div(beta_power, total_power)
-
-		alpha_theta_ratio = _safe_div(alpha_power, theta_power)
-		beta_alpha_ratio = _safe_div(beta_power, alpha_power)
-
-		# Dominant frequency within [freq_min, freq_max] (global across channels)
-		try:
-			global_psd = np.nanmean(Sxx_main, axis=0)  # (n_freqs_main,)
-			peak_idx = int(np.nanargmax(global_psd))
-			dominant_freq_hz = float(freqs_main[peak_idx])
-		except Exception:
-			dominant_freq_hz = float("nan")
-
-		# Basic session info
-		meas_date = a_raw.info.get("meas_date")
-		if isinstance(meas_date, datetime):
-			meas_date_str = meas_date.strftime("%Y-%m-%d %H:%M:%S")
-		else:
-			meas_date_str = str(meas_date)
-
-		try:
-			times = a_raw.times
-			duration_s = float(times[-1] - times[0]) if times.size > 0 else float("nan")
-		except Exception:
-			duration_s = float("nan")
-
-		sfreq = float(a_raw.info.get("sfreq", float("nan")))
-		n_channels = len(a_raw.info.get("ch_names", []))
-		xdf_filename = dataset_to_filename.get(idx, None)
-
-		rows.append(
-			{
-				"session_idx": idx,
-				"xdf_filename": xdf_filename,
-				"meas_date": meas_date_str,
-				"duration_s": duration_s,
-				"sfreq_hz": sfreq,
-				"n_channels": n_channels,
-				f"total_power_{freq_min:.1f}_to_{freq_max:.1f}_hz": total_power,
-				"delta_power": delta_power,
-				"theta_power": theta_power,
-				"alpha_power": alpha_power,
-				"beta_power": beta_power,
-				"delta_rel": delta_rel,
-				"theta_rel": theta_rel,
-				"alpha_rel": alpha_rel,
-				"beta_rel": beta_rel,
-				"alpha_theta_ratio": alpha_theta_ratio,
-				"beta_alpha_ratio": beta_alpha_ratio,
-				"dominant_freq_hz": dominant_freq_hz,
-			}
-		)
-
-	if not rows:
-		print("No valid spectrogram-based metrics were computed; skipping CSV export.")
-		return output_folder.joinpath(f"{filename_prefix}session_summaries_empty.csv")
-
-	metrics_df = pd.DataFrame.from_records(rows)
-	csv_path = output_folder.joinpath(f"{filename_prefix}session_summaries.csv")
-	metrics_df.to_csv(csv_path, index=False)
-
-	print(f"\nSaved per-session summary metrics to: {csv_path.as_posix()}")
-	return csv_path
 
 
 def _get_channel_bad_intervals(raw: mne.io.BaseRaw, channel_names: List[str]) -> Dict[str, List[Tuple[float, float]]]:
@@ -1062,6 +830,387 @@ class SpectogramPlottingHelper:
 		return output_path
 
 
+	@classmethod
+	def compute_session_summary_metrics(cls, active_only_out_eeg_raws, results, stream_infos_df: Optional[pd.DataFrame], output_folder: Path, freq_min: float = 1.0, freq_max: float = 40.0, filename_prefix: str = "") -> Path:
+		"""
+		Compute simple per-session summary metrics from the spectrogram outputs and save to CSV.
+
+		Metrics are intended to support quick comparison across sessions and include:
+		  - Duration, sampling rate, number of channels
+		  - Bandpower (absolute and relative) for classical bands (delta/theta/alpha/beta)
+		  - Dominant frequency within [freq_min, freq_max]
+
+		Returns:
+			Path to the created CSV file.
+		"""
+		output_folder = Path(output_folder)
+		output_folder.mkdir(parents=True, exist_ok=True)
+
+		rows = []
+
+		# Precompute simple lookup from dataset index -> xdf_filename (if available)
+		dataset_to_filename: Dict[int, str] = {}
+		if stream_infos_df is not None:
+			try:
+				tmp_df = _reset_stream_infos_index_for_groupby(stream_infos_df)
+				if "xdf_dataset_idx" in tmp_df.columns and "xdf_filename" in tmp_df.columns:
+					for ds_idx, grp in tmp_df.groupby("xdf_dataset_idx"):
+						# Use the first filename for this dataset index
+						dataset_to_filename[int(ds_idx)] = str(grp["xdf_filename"].iloc[0])
+					## END for ds_idx, grp in tmp_df.groupby("xdf_dataset_idx")...
+			except Exception as e:
+				print(f"  WARN: failed to derive dataset -> filename mapping: {e}")
+
+		def _band_mean(Sxx_vals: np.ndarray, freqs_vals: np.ndarray, low: float, high: float) -> float:
+			band_mask = (freqs_vals >= low) & (freqs_vals < high)
+			if not np.any(band_mask):
+				return float("nan")
+			return float(np.nanmean(Sxx_vals[:, band_mask]))
+
+		for idx, (a_raw, a_result) in enumerate(zip(active_only_out_eeg_raws, results)):
+			if a_result is None:
+				continue
+			if "spectogram" not in a_result:
+				continue
+
+			try:
+				spect_dict = a_result["spectogram"]
+				Sxx_avg = spect_dict["Sxx_avg"]  # xarray.DataArray: (channels, freqs)
+				freqs_vals = np.asarray(Sxx_avg.coords["freqs"])
+				Sxx_vals = np.asarray(Sxx_avg)  # (n_channels, n_freqs)
+			except Exception as e:
+				print(f"  WARN: failed to unpack spectrogram for session {idx}: {e}")
+				continue
+
+			# Restrict to the main comparison band for global metrics
+			main_band_mask = (freqs_vals >= freq_min) & (freqs_vals <= freq_max)
+			if not np.any(main_band_mask):
+				print(f"  WARN: no frequencies within [{freq_min}, {freq_max}] Hz for session {idx}")
+				continue
+
+			Sxx_main = Sxx_vals[:, main_band_mask]
+			freqs_main = freqs_vals[main_band_mask]
+
+			# Total power in [freq_min, freq_max]
+			total_power = float(np.nanmean(Sxx_main))
+
+			# Classical bands
+			delta_power = _band_mean(Sxx_vals, freqs_vals, 1.0, 4.0)
+			theta_power = _band_mean(Sxx_vals, freqs_vals, 4.0, 8.0)
+			alpha_power = _band_mean(Sxx_vals, freqs_vals, 8.0, 13.0)
+			beta_power = _band_mean(Sxx_vals, freqs_vals, 13.0, 30.0)
+
+			# Relative powers and simple ratios
+			def _safe_div(n: float, d: float) -> float:
+				return float(n / d) if np.isfinite(n) and np.isfinite(d) and d != 0 else float("nan")
+
+			delta_rel = _safe_div(delta_power, total_power)
+			theta_rel = _safe_div(theta_power, total_power)
+			alpha_rel = _safe_div(alpha_power, total_power)
+			beta_rel = _safe_div(beta_power, total_power)
+
+			alpha_theta_ratio = _safe_div(alpha_power, theta_power)
+			beta_alpha_ratio = _safe_div(beta_power, alpha_power)
+
+			# Dominant frequency within [freq_min, freq_max] (global across channels)
+			try:
+				global_psd = np.nanmean(Sxx_main, axis=0)  # (n_freqs_main,)
+				peak_idx = int(np.nanargmax(global_psd))
+				dominant_freq_hz = float(freqs_main[peak_idx])
+			except Exception:
+				dominant_freq_hz = float("nan")
+
+			# Basic session info
+			meas_date = a_raw.info.get("meas_date")
+			if isinstance(meas_date, datetime):
+				meas_date_str = meas_date.strftime("%Y-%m-%d %H:%M:%S")
+			else:
+				meas_date_str = str(meas_date)
+
+			try:
+				times = a_raw.times
+				duration_s = float(times[-1] - times[0]) if times.size > 0 else float("nan")
+			except Exception:
+				duration_s = float("nan")
+
+			sfreq = float(a_raw.info.get("sfreq", float("nan")))
+			n_channels = len(a_raw.info.get("ch_names", []))
+			xdf_filename = dataset_to_filename.get(idx, None)
+
+			rows.append(
+				{
+					"session_idx": idx,
+					"xdf_filename": xdf_filename,
+					"meas_date": meas_date_str,
+					"duration_s": duration_s,
+					"sfreq_hz": sfreq,
+					"n_channels": n_channels,
+					f"total_power_{freq_min:.1f}_to_{freq_max:.1f}_hz": total_power,
+					"delta_power": delta_power,
+					"theta_power": theta_power,
+					"alpha_power": alpha_power,
+					"beta_power": beta_power,
+					"delta_rel": delta_rel,
+					"theta_rel": theta_rel,
+					"alpha_rel": alpha_rel,
+					"beta_rel": beta_rel,
+					"alpha_theta_ratio": alpha_theta_ratio,
+					"beta_alpha_ratio": beta_alpha_ratio,
+					"dominant_freq_hz": dominant_freq_hz,
+				}
+			)
+		## END for idx, (a_raw, a_result) in enumerate(zip(active_only_out_eeg_raws, results))...
+
+		if not rows:
+			print("No valid spectrogram-based metrics were computed; skipping CSV export.")
+			return output_folder.joinpath(f"{filename_prefix}session_summaries_empty.csv")
+
+		metrics_df = pd.DataFrame.from_records(rows)
+		csv_path = output_folder.joinpath(f"{filename_prefix}session_summaries.csv")
+		metrics_df.to_csv(csv_path, index=False)
+
+		print(f"\nSaved per-session summary metrics to: {csv_path.as_posix()}")
+		return csv_path
+
+
+	@classmethod
+	def process_XDFs_main(cls, n_most_recent_sessions_to_preprocess: Optional[int] = 5, should_write_final_merged_eeg_fif: bool = True, included_xdf_file_names: Optional[List]=None, should_load_preprocessed: bool = False, use_computation_cache: bool = True, cache_root: Optional[Path] = None, use_mtime_in_cache_key: bool = False, use_graph_computation_cache: bool = False, absolute_max_workers: int = 2):
+		""" Processes a single .xdf file independently to produce all exports
+
+			from PhoOfflineEEGAnalysis.main_analyze_run import SpectogramPlottingHelper
+			SpectogramPlottingHelper.process_XDFs_main(...)
+
+			If *use_graph_computation_cache* is True (and *use_computation_cache* is True), EEG steps run via the phopymnehelper DAG executor with per-node disk cache under ``cache_root / "node_cache"``; the usual monolithic session pickle and lookup are unchanged.
+
+		"""
+		if cache_root is None:
+			cache_root = pickled_data_path / "computation_cache"
+		cache_root = Path(cache_root)
+		disk_node_cache: Optional[DiskComputationCache] = DiskComputationCache(cache_root / "node_cache") if use_computation_cache else None
+		run_all_params: Dict[str, Any] = {"mask_bad_annotated_times": False}
+		print(f"Computation node cache: root={(cache_root / 'node_cache').resolve().as_posix()}, enabled={disk_node_cache is not None}")
+
+		# SavedSessionProcessor
+
+		sso: SavedSessionsProcessor = SavedSessionsProcessor(eeg_recordings_file_path=eeg_recordings_file_path,
+															headset_motion_recordings_file_path=headset_motion_recordings_file_path, WhisperVideoTranscripts_LSL_Converted_file_path=WhisperVideoTranscripts_LSL_Converted, pho_log_to_LSL_recordings_path=pho_log_to_LSL_recordings_path,
+															eeg_analyzed_parent_export_path=eeg_analyzed_parent_export_path, 
+															n_most_recent_sessions_to_preprocess=n_most_recent_sessions_to_preprocess, 
+															should_load_data=True, should_load_preprocessed=should_load_preprocessed,
+															#  should_load_data=True, should_load_preprocessed=True,
+															)
+
+
+		labRecorder_PostProcessed_path: Path = sso.eeg_analyzed_parent_export_path.joinpath(f'LabRecorder_PostProcessed')
+		labRecorder_PostProcessed_path.mkdir(exist_ok=True)
+
+
+
+		# Parallel XDF file processing
+		assert lab_recorder_output_path.exists()
+
+		lab_recorder_xdf_files: list[Path] = list(lab_recorder_output_path.glob('*.xdf'))
+		n_total_found_files: int = len(lab_recorder_xdf_files)
+
+		# Filter by included file names if specified
+		if included_xdf_file_names is not None:
+			print(f'limiting to included_xdf_file_names: {included_xdf_file_names}...')
+			lab_recorder_xdf_files = [v for v in lab_recorder_xdf_files if v.name in included_xdf_file_names]
+			n_filtered_found_files: int = len(lab_recorder_xdf_files)
+			print(f'\tlimited to {n_filtered_found_files}/{n_total_found_files} files')
+
+		# Limit to n_most_recent_sessions_to_preprocess most recent files
+		if n_most_recent_sessions_to_preprocess is not None and len(lab_recorder_xdf_files) > n_most_recent_sessions_to_preprocess:
+			print(f'Limiting to {n_most_recent_sessions_to_preprocess} most recent XDF files...')
+			# Sort by modification time (most recent first)
+			lab_recorder_xdf_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+			lab_recorder_xdf_files = lab_recorder_xdf_files[:n_most_recent_sessions_to_preprocess]
+			print(f'\tLimited to {len(lab_recorder_xdf_files)}/{n_total_found_files} most recent files')
+
+		if (labRecorder_PostProcessed_path is not None) and should_write_final_merged_eeg_fif:
+			labRecorder_PostProcessed_path.mkdir(exist_ok=True)
+
+		# Determine optimal number of workers
+		cpu_count: int = (os.cpu_count() or 2)
+		absolute_max_workers = min(absolute_max_workers, cpu_count)
+		max_workers = min(len(lab_recorder_xdf_files), absolute_max_workers)
+		print(f"Processing {len(lab_recorder_xdf_files)} XDF files using {max_workers} parallel workers...")
+
+		# Initialize result containers
+		_out_eeg_raw = [None] * len(lab_recorder_xdf_files)
+		_out_motion_raw = [None] * len(lab_recorder_xdf_files)
+		_out_xdf_stream_infos_df = [None] * len(lab_recorder_xdf_files)
+		_out_results = [None] * len(lab_recorder_xdf_files)
+
+
+		def _subfn_process_single_xdf_file(idx_file_tuple):
+			"""Process a single XDF file - captures lots of things 
+			"""
+			an_xdf_file_idx, a_xdf_file = idx_file_tuple
+			try:
+				print(f'  Processing XDF file {an_xdf_file_idx+1}/{len(lab_recorder_xdf_files)}: "{a_xdf_file.name}"...')
+
+				# Load XDF file
+				_obj = LabRecorderXDF.init_from_lab_recorder_xdf_file(a_xdf_file=a_xdf_file)
+				stream_infos = _obj.stream_infos
+				raws = _obj.datasets
+				raws_dict = _obj.datasets_dict
+
+				eeg_raws = raws_dict.get(DataModalityType.EEG.value, [])
+
+				if len(eeg_raws) == 0:
+					print(f'  WARN: no EEG streams found in "{a_xdf_file.as_posix()}". Skipping file.')
+					return an_xdf_file_idx, None, None, None, None
+
+				# Merge by device so we can handle multiple EEG streams per XDF
+				merged_eeg_raws, merge_meta = LabRecorderXDF.merge_eeg_streams_by_device(
+					eeg_raws=eeg_raws, strict_merge=False, debug_print=False
+				)
+				if len(merged_eeg_raws) == 0:
+					print(f'  WARN: could not produce any merged EEG datasets for "{a_xdf_file.as_posix()}". Skipping file.')
+					return an_xdf_file_idx, None, None, None, None
+
+				# Save post-processed data if requested (one set per merged dataset)
+				exports_dict = None
+				if should_write_final_merged_eeg_fif:
+					_, exports_dict = LabRecorderXDF.save_post_processed_to_fif(
+						raws_dict=raws_dict,
+						a_xdf_file=a_xdf_file,
+						labRecorder_PostProcessed_path=labRecorder_PostProcessed_path,
+					)
+
+				# For the notebook path we currently return only the first merged EEG
+				# dataset for downstream plotting, but we still respect multi-stream
+				# handling for disk outputs.
+				eeg_raw = merged_eeg_raws[0]
+				motion_raws = raws_dict.get(DataModalityType.MOTION.value, [])
+				motion_raw = motion_raws[0] if len(motion_raws) > 0 else None
+
+				# Add metadata
+				stream_infos['lab_recorder_xdf_file_idx'] = an_xdf_file_idx
+				stream_infos['xdf_filename'] = a_xdf_file.name
+				stream_infos['eeg_device_group_idx'] = 0
+				stream_infos['eeg_device_key'] = merge_meta[0].get('device_key', 'device_0')
+				stream_infos['n_eeg_segments_in_group'] = merge_meta[0].get('n_segments', 1)
+
+				if exports_dict is not None:
+					for a_format, per_idx_dict in exports_dict.items():
+						export_path = per_idx_dict.get(0, None)
+						if export_path is not None:
+							# Ensure we handle both Path and string-like values
+							stream_infos[f'proccessed_{a_format}_filename'] = Path(export_path).name
+					## END for a_format, per_idx_dict in exports_dict.items()...
+
+				# Up-convert and set montage
+				eeg_raw = MNEHelpers.up_convert_raw_obj(eeg_raw)
+				if motion_raw is not None:
+					motion_raw = MNEHelpers.up_convert_raw_obj(motion_raw)
+
+				EEGData.set_montage(datasets_EEG=[eeg_raw])
+				eeg_raw.debug_test_annotations_timestamps()
+
+				# Do post-processing stage
+				result = None
+				try:
+					meas_date = eeg_raw.info.get('meas_date', 'Unknown')
+					print(f"  Processing merged EEG dataset for file {an_xdf_file_idx+1}/{len(lab_recorder_xdf_files)} (meas_date: {meas_date})")
+					xdf_mtime_for_fp = a_xdf_file.stat().st_mtime
+					session_fp = EEGComputationRegistryHelper.session_fingerprint_for_raw_or_path(eeg_raw, path=a_xdf_file, mtime=xdf_mtime_for_fp if use_mtime_in_cache_key else None)
+					result = EEGComputationRegistryHelper.run_eeg_graph_legacy_ordered(raw=eeg_raw, session=session_fp, global_params=run_all_params, cache=disk_node_cache, use_cache=True, parallel=False)
+					print(f"  Completed merged EEG dataset for file {an_xdf_file_idx+1}/{len(lab_recorder_xdf_files)} (meas_date: {meas_date})")
+				except Exception as e:
+					print(f"  ERROR processing merged EEG dataset for file {an_xdf_file_idx+1}: {e}")
+
+				print(f'  Completed XDF file {an_xdf_file_idx+1}/{len(lab_recorder_xdf_files)}: "{a_xdf_file.name}"')
+				return an_xdf_file_idx, eeg_raw, motion_raw, stream_infos, result
+
+			except (ValueError, KeyError, AssertionError, TypeError) as e:
+				print(f'  ERROR in XDF file {an_xdf_file_idx+1}: {e}\n  Skipping file.')
+				return an_xdf_file_idx, None, None, None, None
+
+			except Exception as e:
+				print(f'  EXCEPTION in XDF file {an_xdf_file_idx+1}: {e}')
+				raise
+
+
+		# ---------------------------------------------------------------------------- #
+		#                 Parallel processing using ThreadPoolExecutor                 #
+		# ---------------------------------------------------------------------------- #
+		with ThreadPoolExecutor(max_workers=max_workers) as executor:
+			# Submit all tasks
+			future_to_idx = {
+				executor.submit(_subfn_process_single_xdf_file, (idx, xdf_file)): idx 
+				for idx, xdf_file in enumerate(lab_recorder_xdf_files)
+			}
+			
+			# Collect results as they complete
+			for future in as_completed(future_to_idx):
+				try:
+					idx, eeg_raw, motion_raw, stream_infos, result = future.result()
+					_out_eeg_raw[idx] = eeg_raw
+					_out_motion_raw[idx] = motion_raw
+					_out_xdf_stream_infos_df[idx] = stream_infos
+					_out_results[idx] = result
+				except Exception as e:
+					idx = future_to_idx[future]
+					print(f"  EXCEPTION collecting result for file {idx+1}: {e}")
+					_out_eeg_raw[idx] = None
+					_out_motion_raw[idx] = None
+					_out_xdf_stream_infos_df[idx] = None
+					_out_results[idx] = None
+			## END for future in as_completed(future_to_idx)...
+
+
+
+		# Filter out failed files
+		valid_indices = [i for i, (raw, info, result) in enumerate(zip(_out_eeg_raw, _out_xdf_stream_infos_df, _out_results)) if raw is not None and info is not None]
+		_out_eeg_raw = [_out_eeg_raw[i] for i in valid_indices]
+		_out_motion_raw = [_out_motion_raw[i] for i in valid_indices]
+		_out_xdf_stream_infos_df = [_out_xdf_stream_infos_df[i] for i in valid_indices]
+		_out_results = [_out_results[i] for i in valid_indices]
+
+		# Add xdf_dataset_idx to stream_infos
+		for dataset_idx, stream_infos in enumerate(_out_xdf_stream_infos_df):
+			stream_infos['xdf_dataset_idx'] = dataset_idx
+		## END for dataset_idx, stream_infos in enumerate(_out_xdf_stream_infos_df)...
+
+		# Combine stream infos
+		_out_xdf_stream_infos_df = pd.concat(_out_xdf_stream_infos_df)
+		_out_xdf_stream_infos_df = _out_xdf_stream_infos_df.set_index('xdf_dataset_idx')
+
+		# Up-convert and sort (with results following the same order)
+		_out_eeg_raw = MNEHelpers.up_convert_raw_objects(_out_eeg_raw)
+		# Create sorting indices
+		sort_indices = sorted(range(len(_out_eeg_raw)), key=lambda i: (_out_eeg_raw[i].raw_timerange()[0] is None, _out_eeg_raw[i].raw_timerange()[0]))
+		_out_eeg_raw = [_out_eeg_raw[i] for i in sort_indices]
+		_out_motion_raw = [_out_motion_raw[i] for i in sort_indices]
+		_out_results = [_out_results[i] for i in sort_indices]
+
+		# Set montage for all datasets
+		EEGData.set_montage(datasets_EEG=_out_eeg_raw)  # pyright: ignore[reportUnknownMemberType]
+
+		xdf_dataset_indicies = np.unique(deepcopy(_out_xdf_stream_infos_df).reset_index(drop=False, inplace=False)['xdf_dataset_idx'].to_numpy())
+		n_unique_xdf_datasets: int = len(xdf_dataset_indicies)
+		print(f'n_unique_xdf_datasets: {n_unique_xdf_datasets}')
+
+		_out_xdf_stream_infos_df: pd.DataFrame = XDFDataStreamAccessor.init_from_results(_out_xdf_stream_infos_df=_out_xdf_stream_infos_df, active_only_out_eeg_raws=_out_eeg_raw)
+		_out_xdf_stream_infos_df
+
+		## Use the results already computed during parallel processing
+		# No need to call batch_compute_all_eeg_datasets again since we already computed during XDF loading
+		active_only_out_eeg_raws = _out_eeg_raw
+		results = _out_results
+
+		num_sessions: int = len(results)
+		print(f'Processed {num_sessions} sessions with EEG computations')
+
+
+		## OUTPUTS: _out_xdf_stream_infos_df, active_only_out_eeg_raws, active_only_out_motion_raws, results, 
+
+		active_only_out_motion_raws = _out_motion_raw
+		return sso, xdf_dataset_indicies, _out_xdf_stream_infos_df, active_only_out_eeg_raws, active_only_out_motion_raws, results
+
+
 # Configuration
 mne.viz.set_browser_backend("qt")
 mne.set_config("MNE_BROWSER_BACKEND", "qt")
@@ -1111,295 +1260,7 @@ lab_recorder_output_path = Path("E:/Dropbox (Personal)/Databases/UnparsedData/La
 assert lab_recorder_output_path.exists(), f"'{lab_recorder_output_path.as_posix()}' does not exist!"
 
 
-def process_XDFs_main(n_most_recent_sessions_to_preprocess: Optional[int] = 5, should_write_final_merged_eeg_fif: bool = True, included_xdf_file_names: Optional[List]=None, should_load_preprocessed: bool = False, use_computation_cache: bool = True, cache_root: Optional[Path] = None, use_mtime_in_cache_key: bool = False, use_graph_computation_cache: bool = False, absolute_max_workers: int = 2):
-	""" Processes a single .xdf file independently to produce all exports
 
-		from PhoOfflineEEGAnalysis.examples_jupyter.main_analyze_run import process_XDFs_main
-
-		If *use_graph_computation_cache* is True (and *use_computation_cache* is True), EEG steps run via the phopymnehelper DAG executor with per-node disk cache under ``cache_root / "node_cache"``; the usual monolithic session pickle and lookup are unchanged.
-
-	"""
-	if cache_root is None:
-		cache_root = pickled_data_path / "computation_cache"
-	cache_root = Path(cache_root)
-	cache_mgr: Optional[ComputationCacheManager] = ComputationCacheManager(cache_root=cache_root) if use_computation_cache else None
-	disk_node_cache: Optional[DiskComputationCache] = DiskComputationCache(cache_root / "node_cache") if (use_computation_cache and use_graph_computation_cache) else None
-	run_all_params: Dict[str, Any] = {"mask_bad_annotated_times": False}
-	if cache_mgr is not None:
-		history_path = cache_mgr.history_path
-		n_entries = len(cache_mgr.history_df)
-		print(f"Computation cache: root={cache_root.resolve().as_posix()}, history exists={history_path.exists()}, entries={n_entries}")
-
-	# SavedSessionProcessor
-
-	sso: SavedSessionsProcessor = SavedSessionsProcessor(eeg_recordings_file_path=eeg_recordings_file_path,
-														headset_motion_recordings_file_path=headset_motion_recordings_file_path, WhisperVideoTranscripts_LSL_Converted_file_path=WhisperVideoTranscripts_LSL_Converted, pho_log_to_LSL_recordings_path=pho_log_to_LSL_recordings_path,
-														eeg_analyzed_parent_export_path=eeg_analyzed_parent_export_path, 
-														n_most_recent_sessions_to_preprocess=n_most_recent_sessions_to_preprocess, 
-														should_load_data=True, should_load_preprocessed=should_load_preprocessed,
-														#  should_load_data=True, should_load_preprocessed=True,
-														)
-
-
-	labRecorder_PostProcessed_path: Path = sso.eeg_analyzed_parent_export_path.joinpath(f'LabRecorder_PostProcessed')
-	labRecorder_PostProcessed_path.mkdir(exist_ok=True)
-
-
-
-	# Parallel XDF file processing
-	assert lab_recorder_output_path.exists()
-
-	lab_recorder_xdf_files: list[Path] = list(lab_recorder_output_path.glob('*.xdf'))
-	n_total_found_files: int = len(lab_recorder_xdf_files)
-
-	# Filter by included file names if specified
-	if included_xdf_file_names is not None:
-		print(f'limiting to included_xdf_file_names: {included_xdf_file_names}...')
-		lab_recorder_xdf_files = [v for v in lab_recorder_xdf_files if v.name in included_xdf_file_names]
-		n_filtered_found_files: int = len(lab_recorder_xdf_files)
-		print(f'\tlimited to {n_filtered_found_files}/{n_total_found_files} files')
-
-	# Limit to n_most_recent_sessions_to_preprocess most recent files
-	if n_most_recent_sessions_to_preprocess is not None and len(lab_recorder_xdf_files) > n_most_recent_sessions_to_preprocess:
-		print(f'Limiting to {n_most_recent_sessions_to_preprocess} most recent XDF files...')
-		# Sort by modification time (most recent first)
-		lab_recorder_xdf_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-		lab_recorder_xdf_files = lab_recorder_xdf_files[:n_most_recent_sessions_to_preprocess]
-		print(f'\tLimited to {len(lab_recorder_xdf_files)}/{n_total_found_files} most recent files')
-
-	if (labRecorder_PostProcessed_path is not None) and should_write_final_merged_eeg_fif:
-		labRecorder_PostProcessed_path.mkdir(exist_ok=True)
-
-	# Determine optimal number of workers
-	cpu_count: int = (os.cpu_count() or 2)
-	absolute_max_workers = min(absolute_max_workers, cpu_count)
-	max_workers = min(len(lab_recorder_xdf_files), absolute_max_workers)
-	print(f"Processing {len(lab_recorder_xdf_files)} XDF files using {max_workers} parallel workers...")
-
-	# Initialize result containers
-	_out_eeg_raw = [None] * len(lab_recorder_xdf_files)
-	_out_motion_raw = [None] * len(lab_recorder_xdf_files)
-	_out_xdf_stream_infos_df = [None] * len(lab_recorder_xdf_files)
-	_out_results = [None] * len(lab_recorder_xdf_files)
-
-
-	def _subfn_process_single_xdf_file(idx_file_tuple):
-		"""Process a single XDF file - captures lots of things 
-		"""
-		an_xdf_file_idx, a_xdf_file = idx_file_tuple
-		try:
-			print(f'  Processing XDF file {an_xdf_file_idx+1}/{len(lab_recorder_xdf_files)}: "{a_xdf_file.name}"...')
-
-			if cache_mgr is not None:
-				try:
-					xdf_mtime = a_xdf_file.stat().st_mtime
-					cache_key_hex = cache_mgr.compute_key(a_xdf_file, run_all_params, mtime=xdf_mtime if use_mtime_in_cache_key else None)
-					looked_up = cache_mgr.lookup(cache_key_hex, xdf_path=a_xdf_file)
-					if looked_up is not None:
-						result_path, _ = looked_up
-						print(f'  Cache hit: loading result from {result_path.as_posix()}')
-						result = cache_mgr.load_result(result_path)
-						_obj = LabRecorderXDF.init_from_lab_recorder_xdf_file(a_xdf_file=a_xdf_file) ## #TODO 2026-03-02 03:53: - [ ] we do this full loading of the XDF file either way whether it was cached or not
-						stream_infos = _obj.stream_infos
-						raws_dict = _obj.datasets_dict
-						eeg_raws = raws_dict.get(DataModalityType.EEG.value, [])
-						motion_raws = raws_dict.get(DataModalityType.MOTION.value, [])
-						if len(eeg_raws) == 0:
-							print(f'  WARN: no EEG streams (cache hit path) in "{a_xdf_file.as_posix()}". Skipping file.')
-							return an_xdf_file_idx, None, None, None, None
-						merged_eeg_raws, merge_meta = LabRecorderXDF.merge_eeg_streams_by_device(eeg_raws=eeg_raws, strict_merge=False, debug_print=False)
-						if len(merged_eeg_raws) == 0:
-							print(f'  WARN: could not produce merged EEG (cache hit path) for "{a_xdf_file.as_posix()}". Skipping file.')
-							return an_xdf_file_idx, None, None, None, None
-						eeg_raw = merged_eeg_raws[0]
-						motion_raw = motion_raws[0] if len(motion_raws) > 0 else None
-						stream_infos['lab_recorder_xdf_file_idx'] = an_xdf_file_idx
-						stream_infos['xdf_filename'] = a_xdf_file.name
-						stream_infos['eeg_device_group_idx'] = 0
-						stream_infos['eeg_device_key'] = merge_meta[0].get('device_key', 'device_0')
-						stream_infos['n_eeg_segments_in_group'] = merge_meta[0].get('n_segments', 1)
-						eeg_raw = up_convert_raw_obj(eeg_raw)
-						if motion_raw is not None:
-							motion_raw = up_convert_raw_obj(motion_raw)
-						EEGData.set_montage(datasets_EEG=[eeg_raw])
-						eeg_raw.debug_test_annotations_timestamps()
-						print(f'  Cache hit for XDF file {an_xdf_file_idx+1}/{len(lab_recorder_xdf_files)}: "{a_xdf_file.name}"')
-						return an_xdf_file_idx, eeg_raw, motion_raw, stream_infos, result
-				except Exception as e:
-					print(f'  Cache lookup/load failed for file {an_xdf_file_idx+1}, recomputing: {e}')
-
-			# Load XDF file
-			_obj = LabRecorderXDF.init_from_lab_recorder_xdf_file(a_xdf_file=a_xdf_file)
-			stream_infos = _obj.stream_infos
-			raws = _obj.datasets
-			raws_dict = _obj.datasets_dict
-
-			eeg_raws = raws_dict.get(DataModalityType.EEG.value, [])
-
-			if len(eeg_raws) == 0:
-				print(f'  WARN: no EEG streams found in "{a_xdf_file.as_posix()}". Skipping file.')
-				return an_xdf_file_idx, None, None, None, None
-
-			# Merge by device so we can handle multiple EEG streams per XDF
-			merged_eeg_raws, merge_meta = LabRecorderXDF.merge_eeg_streams_by_device(
-				eeg_raws=eeg_raws, strict_merge=False, debug_print=False
-			)
-			if len(merged_eeg_raws) == 0:
-				print(f'  WARN: could not produce any merged EEG datasets for "{a_xdf_file.as_posix()}". Skipping file.')
-				return an_xdf_file_idx, None, None, None, None
-
-			# Save post-processed data if requested (one set per merged dataset)
-			exports_dict = None
-			if should_write_final_merged_eeg_fif:
-				_, exports_dict = LabRecorderXDF.save_post_processed_to_fif(
-					raws_dict=raws_dict,
-					a_xdf_file=a_xdf_file,
-					labRecorder_PostProcessed_path=labRecorder_PostProcessed_path,
-				)
-
-			# For the notebook path we currently return only the first merged EEG
-			# dataset for downstream plotting, but we still respect multi-stream
-			# handling for disk outputs.
-			eeg_raw = merged_eeg_raws[0]
-			motion_raws = raws_dict.get(DataModalityType.MOTION.value, [])
-			motion_raw = motion_raws[0] if len(motion_raws) > 0 else None
-
-			# Add metadata
-			stream_infos['lab_recorder_xdf_file_idx'] = an_xdf_file_idx
-			stream_infos['xdf_filename'] = a_xdf_file.name
-			stream_infos['eeg_device_group_idx'] = 0
-			stream_infos['eeg_device_key'] = merge_meta[0].get('device_key', 'device_0')
-			stream_infos['n_eeg_segments_in_group'] = merge_meta[0].get('n_segments', 1)
-
-			if exports_dict is not None:
-				for a_format, per_idx_dict in exports_dict.items():
-					export_path = per_idx_dict.get(0, None)
-					if export_path is not None:
-						# Ensure we handle both Path and string-like values
-						stream_infos[f'proccessed_{a_format}_filename'] = Path(export_path).name
-
-			# Up-convert and set montage
-			eeg_raw = up_convert_raw_obj(eeg_raw)
-			if motion_raw is not None:
-				motion_raw = up_convert_raw_obj(motion_raw)
-			EEGData.set_montage(datasets_EEG=[eeg_raw])
-			eeg_raw.debug_test_annotations_timestamps()
-
-			# Do post-processing stage
-			result = None
-			try:
-				meas_date = eeg_raw.info.get('meas_date', 'Unknown')
-				print(f"  Processing merged EEG dataset for file {an_xdf_file_idx+1}/{len(lab_recorder_xdf_files)} (meas_date: {meas_date})")
-				# Disable BAD_* annotation masking for spectrograms in this pipeline to reduce NaN gaps
-				if disk_node_cache is not None:
-					xdf_mtime_for_fp = a_xdf_file.stat().st_mtime
-					session_fp = session_fingerprint_for_raw_or_path(eeg_raw, path=a_xdf_file, mtime=xdf_mtime_for_fp if use_mtime_in_cache_key else None)
-					result = run_eeg_graph_legacy_ordered(raw=eeg_raw, session=session_fp, global_params=run_all_params, cache=disk_node_cache, use_cache=True, parallel=False)
-				else:
-					result = EEGComputations.run_all(raw=eeg_raw, mask_bad_annotated_times=False)
-				print(f"  Completed merged EEG dataset for file {an_xdf_file_idx+1}/{len(lab_recorder_xdf_files)} (meas_date: {meas_date})")
-			except Exception as e:
-				print(f"  ERROR processing merged EEG dataset for file {an_xdf_file_idx+1}: {e}")
-
-			if cache_mgr is not None and result is not None:
-				try:
-					xdf_mtime = a_xdf_file.stat().st_mtime
-					cache_key_hex = cache_mgr.compute_key(a_xdf_file, run_all_params, mtime=xdf_mtime if use_mtime_in_cache_key else None)
-					fif_filename = None
-					for k, v in stream_infos.items():
-						if isinstance(k, str) and "proccessed" in k and "filename" in k and v is not None and str(v).strip() != "":
-							fif_filename = str(v).strip()
-							break
-					cache_mgr.save_result(cache_key_hex, result, a_xdf_file, xdf_mtime, run_all_params, fif_filename)
-				except Exception as e:
-					print(f"  WARN: failed to save result to cache for file {an_xdf_file_idx+1}: {e}")
-
-			print(f'  Completed XDF file {an_xdf_file_idx+1}/{len(lab_recorder_xdf_files)}: "{a_xdf_file.name}"')
-			return an_xdf_file_idx, eeg_raw, motion_raw, stream_infos, result
-
-		except (ValueError, KeyError, AssertionError, TypeError) as e:
-			print(f'  ERROR in XDF file {an_xdf_file_idx+1}: {e}\n  Skipping file.')
-			return an_xdf_file_idx, None, None, None, None
-
-		except Exception as e:
-			print(f'  EXCEPTION in XDF file {an_xdf_file_idx+1}: {e}')
-			raise
-
-
-	# ---------------------------------------------------------------------------- #
-	#                 Parallel processing using ThreadPoolExecutor                 #
-	# ---------------------------------------------------------------------------- #
-	with ThreadPoolExecutor(max_workers=max_workers) as executor:
-		# Submit all tasks
-		future_to_idx = {
-			executor.submit(_subfn_process_single_xdf_file, (idx, xdf_file)): idx 
-			for idx, xdf_file in enumerate(lab_recorder_xdf_files)
-		}
-		
-		# Collect results as they complete
-		for future in as_completed(future_to_idx):
-			try:
-				idx, eeg_raw, motion_raw, stream_infos, result = future.result()
-				_out_eeg_raw[idx] = eeg_raw
-				_out_motion_raw[idx] = motion_raw
-				_out_xdf_stream_infos_df[idx] = stream_infos
-				_out_results[idx] = result
-			except Exception as e:
-				idx = future_to_idx[future]
-				print(f"  EXCEPTION collecting result for file {idx+1}: {e}")
-				_out_eeg_raw[idx] = None
-				_out_motion_raw[idx] = None
-				_out_xdf_stream_infos_df[idx] = None
-				_out_results[idx] = None
-
-
-
-	# Filter out failed files
-	valid_indices = [i for i, (raw, info, result) in enumerate(zip(_out_eeg_raw, _out_xdf_stream_infos_df, _out_results)) if raw is not None and info is not None]
-	_out_eeg_raw = [_out_eeg_raw[i] for i in valid_indices]
-	_out_motion_raw = [_out_motion_raw[i] for i in valid_indices]
-	_out_xdf_stream_infos_df = [_out_xdf_stream_infos_df[i] for i in valid_indices]
-	_out_results = [_out_results[i] for i in valid_indices]
-
-	# Add xdf_dataset_idx to stream_infos
-	for dataset_idx, stream_infos in enumerate(_out_xdf_stream_infos_df):
-		stream_infos['xdf_dataset_idx'] = dataset_idx
-
-	# Combine stream infos
-	_out_xdf_stream_infos_df = pd.concat(_out_xdf_stream_infos_df)
-	_out_xdf_stream_infos_df = _out_xdf_stream_infos_df.set_index('xdf_dataset_idx')
-
-	# Up-convert and sort (with results following the same order)
-	_out_eeg_raw = up_convert_raw_objects(_out_eeg_raw)
-	# Create sorting indices
-	sort_indices = sorted(range(len(_out_eeg_raw)), key=lambda i: (_out_eeg_raw[i].raw_timerange()[0] is None, _out_eeg_raw[i].raw_timerange()[0]))
-	_out_eeg_raw = [_out_eeg_raw[i] for i in sort_indices]
-	_out_motion_raw = [_out_motion_raw[i] for i in sort_indices]
-	_out_results = [_out_results[i] for i in sort_indices]
-
-	# Set montage for all datasets
-	EEGData.set_montage(datasets_EEG=_out_eeg_raw)  # pyright: ignore[reportUnknownMemberType]
-
-	xdf_dataset_indicies = np.unique(deepcopy(_out_xdf_stream_infos_df).reset_index(drop=False, inplace=False)['xdf_dataset_idx'].to_numpy())
-	n_unique_xdf_datasets: int = len(xdf_dataset_indicies)
-	print(f'n_unique_xdf_datasets: {n_unique_xdf_datasets}')
-
-	_out_xdf_stream_infos_df: pd.DataFrame = XDFDataStreamAccessor.init_from_results(_out_xdf_stream_infos_df=_out_xdf_stream_infos_df, active_only_out_eeg_raws=_out_eeg_raw)
-	_out_xdf_stream_infos_df
-
-	## Use the results already computed during parallel processing
-	# No need to call batch_compute_all_eeg_datasets again since we already computed during XDF loading
-	active_only_out_eeg_raws = _out_eeg_raw
-	results = _out_results
-
-	num_sessions: int = len(results)
-	print(f'Processed {num_sessions} sessions with EEG computations')
-
-
-	## OUTPUTS: _out_xdf_stream_infos_df, active_only_out_eeg_raws, active_only_out_motion_raws, results, 
-
-	active_only_out_motion_raws = _out_motion_raw
-	return sso, xdf_dataset_indicies, _out_xdf_stream_infos_df, active_only_out_eeg_raws, active_only_out_motion_raws, results
 
 
 # xdf_stream_infos_df: pd.DataFrame = XDFDataStreamAccessor.init_from_results(_out_xdf_stream_infos_df=_out_xdf_stream_infos_df, active_only_out_eeg_raws=active_only_out_eeg_raws)
@@ -1449,7 +1310,7 @@ if __name__ == "__main__":
 
 	export_date_prefix = datetime.now().strftime("%Y-%m-%d_")
 
-	sso, xdf_dataset_indicies, _out_xdf_stream_infos_df, active_only_out_eeg_raws, active_only_out_motion_raws, results = process_XDFs_main(included_xdf_file_names=included_xdf_file_names, 
+	sso, xdf_dataset_indicies, _out_xdf_stream_infos_df, active_only_out_eeg_raws, active_only_out_motion_raws, results = SpectogramPlottingHelper.process_XDFs_main(included_xdf_file_names=included_xdf_file_names, 
 																												n_most_recent_sessions_to_preprocess=n_most_recent_sessions_to_preprocess,
 																												should_write_final_merged_eeg_fif=should_write_final_merged_eeg_fif,
 																												should_load_preprocessed=should_load_preprocessed,
@@ -1478,7 +1339,7 @@ if __name__ == "__main__":
 	# ------------------------------------------------------------------------- #
 	print('\nComputing per-session summary metrics from spectrograms...')
 	summary_output_folder = outputs_root_folder.joinpath('session_summaries')
-	summary_csv_path = compute_session_summary_metrics(
+	summary_csv_path = SpectogramPlottingHelper.compute_session_summary_metrics(
 		active_only_out_eeg_raws=active_only_out_eeg_raws,
 		results=results,
 		stream_infos_df=_out_xdf_stream_infos_df,

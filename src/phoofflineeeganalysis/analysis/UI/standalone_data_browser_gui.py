@@ -380,23 +380,25 @@ class StandaloneResultsBrowserApp(param.Parameterized):
             print(f"Export failed: {e}")
 
 
-def export_results_browser(ds: xr.Dataset, output_path: str, comments_df: Optional[pd.DataFrame] = None) -> str:
-    """
-    Build the standalone results browser and save it as a self-contained HTML.
-    Returns the output path on success.
-    """
-    app = StandaloneResultsBrowserApp(ds=ds, comments_df=comments_df)
-    layout = app.panel()
-    layout.save(output_path, embed=True)
-    return output_path
+    @classmethod
+    def export_results_browser(cls, ds: xr.Dataset, output_path: str, comments_df: Optional[pd.DataFrame] = None) -> str:
+        """
+        Build the standalone results browser and save it as a self-contained HTML.
+        Returns the output path on success.
+        """
+        app = StandaloneResultsBrowserApp(ds=ds, comments_df=comments_df)
+        layout = app.panel()
+        layout.save(output_path, embed=True)
+        return output_path
 
 
-def make_app(ds: xr.Dataset, comments_df: Optional[pd.DataFrame] = None):
-    """
-    Factory for the standalone results browser. Returns a Panel layout.
-    """
-    app = StandaloneResultsBrowserApp(ds=ds, comments_df=comments_df)
-    return app.panel()
+    @classmethod
+    def make_app(cls, ds: xr.Dataset, comments_df: Optional[pd.DataFrame] = None):
+        """
+        Factory for the standalone results browser. Returns a Panel layout.
+        """
+        app = StandaloneResultsBrowserApp(ds=ds, comments_df=comments_df)
+        return app.panel()
 
 
 def _get_default_panel():
@@ -405,7 +407,7 @@ def _get_default_panel():
         comments = globals().get('comments_df', None)
         if ds is None:
             return pn.Column(pn.pane.Markdown("No dataset `ds_disk` found. Use `make_app(ds, comments_df)`."))
-        return make_app(ds, comments_df=comments)
+        return StandaloneResultsBrowserApp.make_app(ds, comments_df=comments)
     except Exception:
         return pn.Column(pn.pane.Markdown("Error while creating default app. Use `make_app(ds, comments_df)`."))
 
