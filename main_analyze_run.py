@@ -36,6 +36,8 @@ from phopymnehelper.analysis.computations.eeg_registry import EEGComputationRegi
 from phopymnehelper.SavedSessionsProcessor import SavedSessionsProcessor, DataModalityType
 from phopymnehelper.xdf_files import LabRecorderXDF, XDFDataStreamAccessor
 
+from phoofflineeeganalysis.analysis.session_catalog import SessionCatalog, get_or_create_catalog
+
 COMPUTATION_HISTORY_COLUMNS = ["cache_key_hex", "xdf_path", "xdf_mtime", "params_json", "result_path", "fif_filename", "computed_at"]
 
 
@@ -131,6 +133,8 @@ class SpectogramPlottingHelper:
 
 		for idx, (a_raw, a_result) in enumerate(zip(active_only_out_eeg_raws, results)):
 			try:
+				if a_result is None or a_result.get('spectogram') is None:
+					continue
 				# Get session metadata
 				meas_date = a_raw.info.get('meas_date')
 				if meas_date:
@@ -839,6 +843,7 @@ class SpectogramPlottingHelper:
 		  - Duration, sampling rate, number of channels
 		  - Bandpower (absolute and relative) for classical bands (delta/theta/alpha/beta)
 		  - Dominant frequency within [freq_min, freq_max]
+		  - EEG manifold (PCA) trajectory scalars when ``eeg_manifold`` is present in results
 
 		Returns:
 			Path to the created CSV file.
@@ -866,6 +871,54 @@ class SpectogramPlottingHelper:
 			if not np.any(band_mask):
 				return float("nan")
 			return float(np.nanmean(Sxx_vals[:, band_mask]))
+
+		def _manifold_summary_scalars(manifold_result) -> Dict[str, float]:
+			"""Extract per-session PC trajectory scalars from an ``eeg_manifold`` result dict."""
+			out: Dict[str, float] = {
+				"manifold_n_windows": float("nan"),
+				"manifold_pc1_std": float("nan"),
+				"manifold_pc2_std": float("nan"),
+				"manifold_pc3_std": float("nan"),
+				"manifold_pc1_range": float("nan"),
+				"manifold_pc2_range": float("nan"),
+				"manifold_pc3_range": float("nan"),
+				"manifold_traj_path_length": float("nan"),
+				"manifold_traj_speed_rms": float("nan"),
+			}
+			if not isinstance(manifold_result, dict):
+				return out
+			try:
+				embedding = np.asarray(manifold_result.get("embedding"), dtype=float)
+				times = np.asarray(manifold_result.get("times"), dtype=float)
+				n_windows = int(manifold_result.get("n_windows", embedding.shape[0] if embedding.ndim == 2 else 0))
+				out["manifold_n_windows"] = float(n_windows)
+				if embedding.ndim != 2 or embedding.shape[0] == 0:
+					return out
+				n_comp = min(3, embedding.shape[1])
+				for i in range(n_comp):
+					col = embedding[:, i]
+					finite = col[np.isfinite(col)]
+					if finite.size == 0:
+						continue
+					out[f"manifold_pc{i + 1}_std"] = float(np.nanstd(finite))
+					out[f"manifold_pc{i + 1}_range"] = float(np.nanmax(finite) - np.nanmin(finite))
+				## END for i in range(n_comp)....
+				if embedding.shape[0] >= 2:
+					diffs = np.diff(embedding, axis=0)
+					step_lengths = np.linalg.norm(diffs, axis=1)
+					finite_steps = step_lengths[np.isfinite(step_lengths)]
+					if finite_steps.size > 0:
+						out["manifold_traj_path_length"] = float(np.nansum(finite_steps))
+					if times.size == embedding.shape[0]:
+						dt = np.diff(times)
+						with np.errstate(divide="ignore", invalid="ignore"):
+							speeds = step_lengths / dt
+						finite_speeds = speeds[np.isfinite(speeds)]
+						if finite_speeds.size > 0:
+							out["manifold_traj_speed_rms"] = float(np.sqrt(np.nanmean(np.square(finite_speeds))))
+			except Exception:
+				return out
+			return out
 
 		for idx, (a_raw, a_result) in enumerate(zip(active_only_out_eeg_raws, results)):
 			if a_result is None:
@@ -936,6 +989,7 @@ class SpectogramPlottingHelper:
 			sfreq = float(a_raw.info.get("sfreq", float("nan")))
 			n_channels = len(a_raw.info.get("ch_names", []))
 			xdf_filename = dataset_to_filename.get(idx, None)
+			manifold_scalars = _manifold_summary_scalars(a_result.get("eeg_manifold"))
 
 			rows.append(
 				{
@@ -957,6 +1011,7 @@ class SpectogramPlottingHelper:
 					"alpha_theta_ratio": alpha_theta_ratio,
 					"beta_alpha_ratio": beta_alpha_ratio,
 					"dominant_freq_hz": dominant_freq_hz,
+					**manifold_scalars,
 				}
 			)
 		## END for idx, (a_raw, a_result) in enumerate(zip(active_only_out_eeg_raws, results))...
@@ -974,13 +1029,15 @@ class SpectogramPlottingHelper:
 
 
 	@classmethod
-	def process_XDFs_main(cls, n_most_recent_sessions_to_preprocess: Optional[int] = 5, should_write_final_merged_eeg_fif: bool = True, included_xdf_file_names: Optional[List]=None, should_load_preprocessed: bool = False, use_computation_cache: bool = True, cache_root: Optional[Path] = None, use_mtime_in_cache_key: bool = False, use_graph_computation_cache: bool = False, absolute_max_workers: int = 2):
+	def process_XDFs_main(cls, n_most_recent_sessions_to_preprocess: Optional[int] = 5, should_write_final_merged_eeg_fif: bool = True, included_xdf_file_names: Optional[List]=None, should_load_preprocessed: bool = False, use_computation_cache: bool = True, cache_root: Optional[Path] = None, use_mtime_in_cache_key: bool = False, use_graph_computation_cache: bool = False, absolute_max_workers: int = 2, session_catalog: Optional[SessionCatalog] = None, use_session_catalog: bool = True):
 		""" Processes a single .xdf file independently to produce all exports
 
 			from PhoOfflineEEGAnalysis.main_analyze_run import SpectogramPlottingHelper
 			SpectogramPlottingHelper.process_XDFs_main(...)
 
 			If *use_graph_computation_cache* is True (and *use_computation_cache* is True), EEG steps run via the phopymnehelper DAG executor with per-node disk cache under ``cache_root / "node_cache"``; the usual monolithic session pickle and lookup are unchanged.
+
+			When *use_session_catalog* is True, discovery and per-file processing status are upserted into a SQLite session catalog (default under ``pickled_data_path/session_catalog``).
 
 		"""
 		if cache_root is None:
@@ -1030,6 +1087,13 @@ class SpectogramPlottingHelper:
 		if (labRecorder_PostProcessed_path is not None) and should_write_final_merged_eeg_fif:
 			labRecorder_PostProcessed_path.mkdir(exist_ok=True)
 
+		catalog: Optional[SessionCatalog] = session_catalog
+		if use_session_catalog and catalog is None:
+			catalog = get_or_create_catalog(pickled_data_path=pickled_data_path)
+		if catalog is not None:
+			n_discovered = catalog.discover_and_upsert(lab_recorder_output_path, recordings_extensions=['.xdf'])
+			print(f"Session catalog: {catalog.db_path.as_posix()} (discovered/upserted {n_discovered} XDF files under {lab_recorder_output_path.as_posix()})")
+
 		# Determine optimal number of workers
 		cpu_count: int = (os.cpu_count() or 2)
 		absolute_max_workers = min(absolute_max_workers, cpu_count)
@@ -1049,6 +1113,8 @@ class SpectogramPlottingHelper:
 			an_xdf_file_idx, a_xdf_file = idx_file_tuple
 			try:
 				print(f'  Processing XDF file {an_xdf_file_idx+1}/{len(lab_recorder_xdf_files)}: "{a_xdf_file.name}"...')
+				if catalog is not None:
+					catalog.mark_computing(a_xdf_file)
 
 				# Load XDF file
 				_obj = LabRecorderXDF.init_from_lab_recorder_xdf_file(a_xdf_file=a_xdf_file)
@@ -1060,6 +1126,8 @@ class SpectogramPlottingHelper:
 
 				if len(eeg_raws) == 0:
 					print(f'  WARN: no EEG streams found in "{a_xdf_file.as_posix()}". Skipping file.')
+					if catalog is not None:
+						catalog.mark_failed(a_xdf_file, error="no EEG streams found")
 					return an_xdf_file_idx, None, None, None, None
 
 				# Merge by device so we can handle multiple EEG streams per XDF
@@ -1068,10 +1136,14 @@ class SpectogramPlottingHelper:
 				)
 				if len(merged_eeg_raws) == 0:
 					print(f'  WARN: could not produce any merged EEG datasets for "{a_xdf_file.as_posix()}". Skipping file.')
+					if catalog is not None:
+						catalog.mark_failed(a_xdf_file, error="could not produce merged EEG datasets")
 					return an_xdf_file_idx, None, None, None, None
 
 				# Save post-processed data if requested (one set per merged dataset)
 				exports_dict = None
+				fif_export_path = None
+				mat_export_path = None
 				if should_write_final_merged_eeg_fif:
 					_, exports_dict = LabRecorderXDF.save_post_processed_to_fif(
 						raws_dict=raws_dict,
@@ -1099,6 +1171,10 @@ class SpectogramPlottingHelper:
 						if export_path is not None:
 							# Ensure we handle both Path and string-like values
 							stream_infos[f'proccessed_{a_format}_filename'] = Path(export_path).name
+							if a_format == 'fif':
+								fif_export_path = Path(export_path)
+							elif a_format == 'mat':
+								mat_export_path = Path(export_path)
 					## END for a_format, per_idx_dict in exports_dict.items()...
 
 				# Up-convert and set montage
@@ -1109,27 +1185,53 @@ class SpectogramPlottingHelper:
 				EEGData.set_montage(datasets_EEG=[eeg_raw])
 				eeg_raw.debug_test_annotations_timestamps()
 
+				meas_date = eeg_raw.info.get('meas_date', None)
+				try:
+					duration_sec = float(eeg_raw.n_times) / float(eeg_raw.info['sfreq']) if eeg_raw.info.get('sfreq') else None
+				except Exception:
+					duration_sec = None
+
+				if catalog is not None and (fif_export_path is not None or mat_export_path is not None):
+					catalog.mark_exported(a_xdf_file, fif_path=fif_export_path, mat_path=mat_export_path, recording_datetime=meas_date if isinstance(meas_date, datetime) else None, duration_sec=duration_sec)
+
 				# Do post-processing stage
 				result = None
 				try:
-					meas_date = eeg_raw.info.get('meas_date', 'Unknown')
 					print(f"  Processing merged EEG dataset for file {an_xdf_file_idx+1}/{len(lab_recorder_xdf_files)} (meas_date: {meas_date})")
 					xdf_mtime_for_fp = a_xdf_file.stat().st_mtime
 					session_fp = EEGComputationRegistryHelper.session_fingerprint_for_raw_or_path(eeg_raw, path=a_xdf_file, mtime=xdf_mtime_for_fp if use_mtime_in_cache_key else None)
-					result = EEGComputationRegistryHelper.run_eeg_graph_legacy_ordered(raw=eeg_raw, session=session_fp, global_params=run_all_params, cache=disk_node_cache, use_cache=True, parallel=False)
+					extras = {}
+					if isinstance(meas_date, datetime):
+						md = meas_date if meas_date.tzinfo is not None else meas_date.replace(tzinfo=timezone.utc)
+						extras["session_t_start_unix"] = float(md.timestamp())
+					result = EEGComputationRegistryHelper.run_eeg_graph_legacy_ordered(raw=eeg_raw, session=session_fp, global_params=run_all_params, cache=disk_node_cache, use_cache=True, parallel=False, extras=extras)
 					print(f"  Completed merged EEG dataset for file {an_xdf_file_idx+1}/{len(lab_recorder_xdf_files)} (meas_date: {meas_date})")
+					if catalog is not None and result is not None:
+						# Prefer exported if artifacts were written; otherwise computed
+						if fif_export_path is not None or mat_export_path is not None:
+							catalog.mark_exported(a_xdf_file, fif_path=fif_export_path, mat_path=mat_export_path, recording_datetime=meas_date if isinstance(meas_date, datetime) else None, duration_sec=duration_sec)
+						else:
+							catalog.mark_computed(a_xdf_file, recording_datetime=meas_date if isinstance(meas_date, datetime) else None, duration_sec=duration_sec, params_json=run_all_params)
+					elif catalog is not None and result is None:
+						catalog.mark_failed(a_xdf_file, error="EEG graph returned no result")
 				except Exception as e:
 					print(f"  ERROR processing merged EEG dataset for file {an_xdf_file_idx+1}: {e}")
+					if catalog is not None:
+						catalog.mark_failed(a_xdf_file, error=str(e))
 
 				print(f'  Completed XDF file {an_xdf_file_idx+1}/{len(lab_recorder_xdf_files)}: "{a_xdf_file.name}"')
 				return an_xdf_file_idx, eeg_raw, motion_raw, stream_infos, result
 
 			except (ValueError, KeyError, AssertionError, TypeError) as e:
 				print(f'  ERROR in XDF file {an_xdf_file_idx+1}: {e}\n  Skipping file.')
+				if catalog is not None:
+					catalog.mark_failed(a_xdf_file, error=str(e))
 				return an_xdf_file_idx, None, None, None, None
 
 			except Exception as e:
 				print(f'  EXCEPTION in XDF file {an_xdf_file_idx+1}: {e}')
+				if catalog is not None:
+					catalog.mark_failed(a_xdf_file, error=str(e))
 				raise
 
 
@@ -1253,7 +1355,8 @@ pickled_data_path.mkdir(exist_ok=True)
 assert pickled_data_path.exists(), f"'{pickled_data_path.as_posix()}' does not exist!"
 
 
-outputs_root_folder: Path = Path('L:/AITEMP/PhoOfflineEEGAnalysisOutputs')
+# outputs_root_folder: Path = Path('L:/AITEMP/PhoOfflineEEGAnalysisOutputs')
+outputs_root_folder: Path = Path('C:/AITEMP/PhoOfflineEEGAnalysisOutputs')
 assert outputs_root_folder.exists(), f"'{outputs_root_folder.as_posix()}' does not exist!"
 
 lab_recorder_output_path = Path("E:/Dropbox (Personal)/Databases/UnparsedData/LabRecorderStudies/sub-P001")
@@ -1270,9 +1373,9 @@ assert lab_recorder_output_path.exists(), f"'{lab_recorder_output_path.as_posix(
 if __name__ == "__main__":
 
 	# n_most_recent_sessions_to_preprocess: int = None # None means all sessions
-	# n_most_recent_sessions_to_preprocess: int = 55
+	n_most_recent_sessions_to_preprocess: int = 55
 	# n_most_recent_sessions_to_preprocess: int = 15
-	n_most_recent_sessions_to_preprocess: int = 5
+	# n_most_recent_sessions_to_preprocess: int = 5
 
 	should_load_preprocessed: bool = False
 	# should_load_preprocessed: bool = True
@@ -1310,11 +1413,19 @@ if __name__ == "__main__":
 
 	export_date_prefix = datetime.now().strftime("%Y-%m-%d_")
 
+	# Session discovery/compute catalog (SQLite) — discover all XDFs, then update during/after processing
+	session_catalog: SessionCatalog = get_or_create_catalog(pickled_data_path=pickled_data_path)
+	n_discovered = session_catalog.discover_and_upsert(lab_recorder_output_path, recordings_extensions=['.xdf'])
+	print(f"Session catalog DB: {session_catalog.db_path.as_posix()}")
+	print(f"  discovered/upserted {n_discovered} XDF files from {lab_recorder_output_path.as_posix()}")
+
 	sso, xdf_dataset_indicies, _out_xdf_stream_infos_df, active_only_out_eeg_raws, active_only_out_motion_raws, results = SpectogramPlottingHelper.process_XDFs_main(included_xdf_file_names=included_xdf_file_names, 
 																												n_most_recent_sessions_to_preprocess=n_most_recent_sessions_to_preprocess,
 																												should_write_final_merged_eeg_fif=should_write_final_merged_eeg_fif,
 																												should_load_preprocessed=should_load_preprocessed,
 																												absolute_max_workers=absolute_max_workers,
+																												session_catalog=session_catalog,
+																												use_session_catalog=True,
 	)
 
 	## Extract comments/notes/annotations/etc from the outputs
@@ -1443,8 +1554,27 @@ if __name__ == "__main__":
 	#     max_sessions_per_page=10
 	# )
 
+	# Finalize session catalog with batch results + export artifact pointers
+	export_params = {
+		"summary_csv_path": str(summary_csv_path) if summary_csv_path is not None else None,
+		"html_output_folder": str(html_output_folder) if html_output_folder is not None else None,
+		"spectrograms_h5_path": str(spectrograms_h5_path) if spectrograms_h5_path is not None else None,
+		"spectrograms_nc_path": str(spectrograms_nc_path) if spectrograms_nc_path is not None else None,
+		"spectrograms_parquet_path": str(spectrograms_parquet_path) if spectrograms_parquet_path is not None else None,
+	}
+	n_catalog_synced = session_catalog.sync_from_processed_batch(
+		_out_xdf_stream_infos_df,
+		active_only_out_eeg_raws,
+		recordings_dir=lab_recorder_output_path,
+		status="computed",
+		summary_csv_path=summary_csv_path,
+		extra_params={k: v for k, v in export_params.items() if v is not None},
+	)
+	print(f"Session catalog synced {n_catalog_synced} processed session(s) → {session_catalog.db_path.as_posix()}")
+
 	print(f'\n=== Processing Complete ===')
 	print(f'Total sessions processed: {len(active_only_out_eeg_raws)}')
+	print(f'Session catalog DB: {session_catalog.db_path.as_posix()}')
 	# print(f'Zarr output: {zarr_out_path}')
 	# print(f'NetCDF output: {netcdf_save_path}')
 	if should_export_html_histograms:

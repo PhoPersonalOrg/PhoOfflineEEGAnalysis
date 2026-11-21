@@ -1,0 +1,50 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Analyze Run",
+			"type": "process",
+			"command": "${workspaceFolder:PhoOfflineEEGAnalysis}/.venv/Scripts/python.exe",
+			"args": ["main_analyze_run.py"],
+			"options": {
+				"cwd": "${workspaceFolder:PhoOfflineEEGAnalysis}"
+			},
+			"presentation": {
+				"reveal": "always",
+				"panel": "dedicated",
+				"focus": true
+			},
+			"problemMatcher": []
+		},
+		{
+			"label": "Session Calendar",
+			"type": "process",
+			"command": "${workspaceFolder:PhoOfflineEEGAnalysis}/.venv/Scripts/python.exe",
+			"args": ["run_session_calendar.py"],
+			"options": {
+				"cwd": "${workspaceFolder:PhoOfflineEEGAnalysis}"
+			},
+			"presentation": {
+				"reveal": "always",
+				"panel": "dedicated",
+				"focus": true
+			},
+			"problemMatcher": []
+		},
+		{
+			"label": "Discover Sessions",
+			"type": "process",
+			"command": "${workspaceFolder:PhoOfflineEEGAnalysis}/.venv/Scripts/python.exe",
+			"args": ["run_discover_sessions.py"],
+			"options": {
+				"cwd": "${workspaceFolder:PhoOfflineEEGAnalysis}"
+			},
+			"presentation": {
+				"reveal": "always",
+				"panel": "dedicated",
+				"focus": true
+			},
+			"problemMatcher": []
+		}
+	]
+}

@@ -1,6 +1,7 @@
 {
 	"folders": [
 		{
+			"name": "PhoOfflineEEGAnalysis",
 			"path": "."
 		},
 		{
@@ -34,6 +35,42 @@
 			"sideBarSectionHeader.border": "#cecece"
 		},
 		"git.ignoreLimitWarning": true,
-		"python.languageServer": "None"
+		"python.languageServer": "None",
+		"actionButtons": {
+			"reloadButton": "↻",
+			"loadNpmCommands": false,
+			"defaultColor": "grey",
+			"commands": [
+				{
+					"name": "$(play) Analyze Run",
+					"tooltip": "Run main_analyze_run.py (discover/process XDFs + update session catalog)",
+					"color": "#7CFC00",
+					"useVsCodeApi": true,
+					"command": "workbench.action.tasks.runTask",
+					"args": ["Analyze Run"]
+				},
+				{
+					"name": "$(calendar) Session Calendar",
+					"tooltip": "Open PyQt session calendar (discover into catalog, then browse)",
+					"color": "#4FC3F7",
+					"useVsCodeApi": true,
+					"command": "workbench.action.tasks.runTask",
+					"args": ["Session Calendar"]
+				},
+				{
+					"name": "$(search) Discover Sessions",
+					"tooltip": "Lightweight XDF discovery into session catalog (no processing)",
+					"color": "#FFD54F",
+					"useVsCodeApi": true,
+					"command": "workbench.action.tasks.runTask",
+					"args": ["Discover Sessions"]
+				}
+			]
+		}
+	},
+	"extensions": {
+		"recommendations": [
+			"jkearins.action-buttons-ext"
+		]
 	}
 }
