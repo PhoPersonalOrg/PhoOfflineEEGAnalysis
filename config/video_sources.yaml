@@ -1,0 +1,39 @@
+# Video discovery roots for VideoCatalog (from VIDEO_FILES.md).
+# Implicit exclude: any path segment named "_DUP".
+# Categories map to consolidate subfolders under H:\PhoBehaviorProject\RECORDINGS\
+
+categories:
+  EyeRecordings:
+    - path: "H:/ScreenRecordings/EyeTrackerVR_Recordings"
+      recursive: false
+
+  WebcamRecordings:
+    - path: "H:/ScreenRecordings/REC_continuous_video_recorder"
+      recursive: false
+    - path: "D:/Captures/PhoBehaviorProject/WebcamRecordings"
+      recursive: false
+    - path: "E:/Dropbox (Personal)/Screenshots/ScreenVideoCaptures/WebcamRecordings"
+      recursive: false
+    - path: "E:/Dropbox (Personal)/personalStore/records/WebcamRecordings"
+      recursive: false
+
+  ScreenRecordings:
+    - path: "H:/ScreenRecordings"
+      recursive: false
+      exclude:
+        - "H:/ScreenRecordings/EyeTrackerVR_Recordings"
+        - "H:/ScreenRecordings/REC_continuous_video_recorder"
+    - path: "F:/ScreenRecordings"
+      recursive: false
+    - path: "E:/Dropbox (Personal)/Screenshots/ScreenVideoCaptures"
+      recursive: false
+      exclude:
+        - "E:/Dropbox (Personal)/Screenshots/ScreenVideoCaptures/WebcamRecordings"
+    - path: "E:/Dropbox (Personal)/Screenshots"
+      recursive: false
+      exclude:
+        - "E:/Dropbox (Personal)/Screenshots/ScreenVideoCaptures"
+        - "E:/Dropbox (Personal)/Screenshots/ShareX Screenshots"
+
+consolidate:
+  dest_root: "H:/PhoBehaviorProject/RECORDINGS"
