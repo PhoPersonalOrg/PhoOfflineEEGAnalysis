@@ -286,6 +286,9 @@ class SessionCalendarWindow(QMainWindow):
             cache_note = " (prefer cached spectrograms)" if str(status or "").lower() in ("computed", "exported") else ""
             if mode == "ipc":
                 self.statusBar().showMessage(f"Zoomed/loaded in running timeline: {Path(xdf_path).name}{cache_note}", 5000)
+            elif mode == "ipc_error":
+                QMessageBox.warning(self, "Open in Timeline", f"Running timeline rejected show_session for:\n{Path(xdf_path).name}\n\nNo new viewer was started.")
+                self.statusBar().showMessage(f"Timeline IPC error for: {Path(xdf_path).name}", 5000)
             else:
                 self.statusBar().showMessage(f"Started offline timeline for: {Path(xdf_path).name}{cache_note}", 5000)
         except Exception as e:

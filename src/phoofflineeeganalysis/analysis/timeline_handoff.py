@@ -10,9 +10,10 @@ import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Optional, Tuple, Union
 
 OFFLINE_TIMELINE_SERVER_NAME = "pypho_timeline_offline"
 _COMPUTED_STATUSES = frozenset({"computed", "exported"})
@@ -60,14 +61,42 @@ def resolve_offline_python(pyphotimeline_root: Optional[Path] = None) -> Path:
     return Path(sys.executable)
 
 
-def try_send_show_session(xdf_path: Union[str, Path], start: Any = None, end: Any = None, prefer_cached_spectrograms: Optional[bool] = None, status: Optional[str] = None, timeout_ms: int = 500) -> bool:
-    """Return True if a running offline timeline accepted the show_session command."""
+def _wait_for_socket_response(sock, timeout_ms: int) -> bool:
+    """Wait for response bytes, pumping the Qt event loop so a same-process server can accept."""
+    from qtpy.QtWidgets import QApplication
+
+    app = QApplication.instance()
+    remaining = max(0, int(timeout_ms))
+    slice_ms = 50
+    while remaining >= 0:
+        if sock.bytesAvailable() > 0:
+            return True
+        if sock.waitForReadyRead(min(slice_ms, max(remaining, 0))):
+            return True
+        if app is not None:
+            app.processEvents()
+        if sock.bytesAvailable() > 0:
+            return True
+        remaining -= slice_ms
+        if remaining < 0:
+            break
+    ## END while remaining >= 0....
+    return sock.bytesAvailable() > 0
+
+
+def try_send_show_session(xdf_path: Union[str, Path], start: Any = None, end: Any = None, prefer_cached_spectrograms: Optional[bool] = None, status: Optional[str] = None, timeout_ms: int = 1500) -> Tuple[bool, Optional[bool]]:
+    """Attempt show_session against a running offline timeline.
+
+    Returns ``(connected, ok)``:
+    - ``(False, None)`` if no server accepted the connection
+    - ``(True, True/False)`` if connected; ``ok`` from the ack (True when response missing/unparseable)
+    """
     from qtpy.QtNetwork import QLocalSocket
 
     sock = QLocalSocket()
     sock.connectToServer(OFFLINE_TIMELINE_SERVER_NAME)
     if not sock.waitForConnected(timeout_ms):
-        return False
+        return False, None
     prefer_cached = _prefer_cached_from_status(status, prefer_cached_spectrograms)
     payload = {
         "cmd": "show_session",
@@ -79,18 +108,19 @@ def try_send_show_session(xdf_path: Union[str, Path], start: Any = None, end: An
     }
     sock.write((json.dumps(payload) + "\n").encode("utf-8"))
     sock.flush()
-    if sock.waitForReadyRead(timeout_ms):
+    sock.waitForBytesWritten(timeout_ms)
+    if _wait_for_socket_response(sock, timeout_ms):
         try:
             raw = bytes(sock.readAll()).decode("utf-8", errors="replace").strip()
             line = raw.splitlines()[0] if raw else "{}"
             resp = json.loads(line)
             sock.disconnectFromServer()
-            return bool(resp.get("ok", False))
+            return True, bool(resp.get("ok", False))
         except Exception:
             sock.disconnectFromServer()
-            return True
+            return True, True
     sock.disconnectFromServer()
-    return True
+    return True, True
 
 
 def spawn_offline_timeline(xdf_path: Union[str, Path], start: Any = None, end: Any = None, prefer_cached_spectrograms: Optional[bool] = None, status: Optional[str] = None) -> subprocess.Popen:
@@ -113,10 +143,11 @@ def spawn_offline_timeline(xdf_path: Union[str, Path], start: Any = None, end: A
     return subprocess.Popen(cmd, cwd=str(root))
 
 
-def open_session_in_timeline(xdf_path: Union[str, Path], start: Any = None, end: Any = None, duration_sec: Optional[float] = None, prefer_cached_spectrograms: Optional[bool] = None, status: Optional[str] = None) -> str:
+def open_session_in_timeline(xdf_path: Union[str, Path], start: Any = None, end: Any = None, duration_sec: Optional[float] = None, prefer_cached_spectrograms: Optional[bool] = None, status: Optional[str] = None, connect_attempts: int = 3, retry_delay_s: float = 0.15) -> str:
     """Show *xdf_path* in offline timeline (IPC zoom/append, or cold-start).
 
-    Returns a short status string: ``ipc`` or ``spawned``.
+    Returns a short status string: ``ipc``, ``spawned``, or ``ipc_error``.
+    Spawns only when no server accepts the connection.
     """
     path = Path(xdf_path)
     if not path.exists():
@@ -133,7 +164,13 @@ def open_session_in_timeline(xdf_path: Union[str, Path], start: Any = None, end:
         except Exception:
             end_val = None
 
-    if try_send_show_session(path, start=start, end=end_val, prefer_cached_spectrograms=prefer_cached_spectrograms, status=status):
-        return "ipc"
+    for attempt in range(max(1, int(connect_attempts))):
+        connected, ok = try_send_show_session(path, start=start, end=end_val, prefer_cached_spectrograms=prefer_cached_spectrograms, status=status)
+        if connected:
+            return "ipc" if ok else "ipc_error"
+        if attempt + 1 < connect_attempts:
+            time.sleep(retry_delay_s)
+    ## END for attempt in range(max(1, int(connect_attempts)))....
+
     spawn_offline_timeline(path, start=start, end=end_val, prefer_cached_spectrograms=prefer_cached_spectrograms, status=status)
     return "spawned"

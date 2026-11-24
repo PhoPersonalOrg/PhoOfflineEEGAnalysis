@@ -59,6 +59,8 @@ Double-click a session in the list, or select it and click **Open in Timeline**:
 2. If no timeline is running, it cold-starts `pyPhoTimeline/main_offline_timeline.py --show-session <xdf_path>`.
 3. When catalog `status` is `computed` or `exported`, handoff sets `--prefer-cached-spectrograms` / IPC `prefer_cached_spectrograms` so the viewer reuses feature-store HDF5 or `PICKLED_COLLECTION/computation_cache` `spectogram` pickles instead of recomputing STFT (falls back to compute on cache miss).
 
+A healthy offline viewer prints `Offline command server listening as 'pypho_timeline_offline'` after startup. Subsequent calendar clicks (and a second `--show-session` launch) forward over IPC instead of opening another window. If the server is up but `show_session` fails, the calendar reports an error and does **not** spawn another process.
+
 Leave the Historical Timeline / offline viewer open for instant zoom on subsequent clicks.
 
 Optional: set `PYPHOTIMELINE_ROOT` if pyPhoTimeline is not the sibling `../pyPhoTimeline` under `ACTIVE_DEV`.
