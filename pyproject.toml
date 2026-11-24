@@ -97,7 +97,10 @@ build-backend = "hatchling.build"
 
 [tool.uv]
 # pyphocorehelpers (transitive via py-pho-timeline) pins pandas 1.5.3, which does not support numpy 2.x ABI.
-override-dependencies = ["pandas>=2.2.0"]
+# Force numpy 2 across path deps (phopymnehelper still declares numpy~=1.20).
+# Full `uv lock` currently fails on path-dep requires-python mismatches (e.g. py-pho-timeline==3.11.11);
+# use `uv sync --frozen` / `uv run --frozen` on this machine until that is reconciled.
+override-dependencies = ["pandas>=2.2.0", "numpy>=2.0.2"]
 
 [tool.uv.sources]
 # WARNING: Dev mne requires numpy>=1.26, which conflicts with pyphocorehelpers (numpy<1.24)
