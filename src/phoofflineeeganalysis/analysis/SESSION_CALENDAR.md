@@ -57,6 +57,7 @@ Double-click a session in the list, or select it and click **Open in Timeline**:
 
 1. If offline timeline is already running (listens on QLocalServer `pypho_timeline_offline`), the calendar sends `show_session` — the viewer **zooms** if that XDF is already loaded, otherwise **appends** it then zooms.
 2. If no timeline is running, it cold-starts `pyPhoTimeline/main_offline_timeline.py --show-session <xdf_path>`.
+3. When catalog `status` is `computed` or `exported`, handoff sets `--prefer-cached-spectrograms` / IPC `prefer_cached_spectrograms` so the viewer reuses feature-store HDF5 or `PICKLED_COLLECTION/computation_cache` `spectogram` pickles instead of recomputing STFT (falls back to compute on cache miss).
 
 Leave the Historical Timeline / offline viewer open for instant zoom on subsequent clicks.
 

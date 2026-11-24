@@ -281,11 +281,13 @@ class SessionCalendarWindow(QMainWindow):
         try:
             from phoofflineeeganalysis.analysis.timeline_handoff import open_session_in_timeline
 
-            mode = open_session_in_timeline(xdf_path, start=recording_datetime, duration_sec=duration_sec)
+            status = payload.get("status") if isinstance(payload, dict) else None
+            mode = open_session_in_timeline(xdf_path, start=recording_datetime, duration_sec=duration_sec, status=status)
+            cache_note = " (prefer cached spectrograms)" if str(status or "").lower() in ("computed", "exported") else ""
             if mode == "ipc":
-                self.statusBar().showMessage(f"Zoomed/loaded in running timeline: {Path(xdf_path).name}", 5000)
+                self.statusBar().showMessage(f"Zoomed/loaded in running timeline: {Path(xdf_path).name}{cache_note}", 5000)
             else:
-                self.statusBar().showMessage(f"Started offline timeline for: {Path(xdf_path).name}", 5000)
+                self.statusBar().showMessage(f"Started offline timeline for: {Path(xdf_path).name}{cache_note}", 5000)
         except Exception as e:
             QMessageBox.warning(self, "Open in Timeline", str(e))
 
