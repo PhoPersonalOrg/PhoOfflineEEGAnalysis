@@ -17,10 +17,10 @@
 			"problemMatcher": []
 		},
 		{
-			"label": "Session Calendar",
+			"label": "Offline Manager",
 			"type": "process",
 			"command": "${workspaceFolder:PhoOfflineEEGAnalysis}/.venv/Scripts/python.exe",
-			"args": ["run_session_calendar.py"],
+			"args": ["run_offline_analysis_manager.py"],
 			"options": {
 				"cwd": "${workspaceFolder:PhoOfflineEEGAnalysis}"
 			},

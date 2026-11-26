@@ -510,6 +510,83 @@ class VideoCatalog:
         return df
 
 
+    def load_calendar_dataframe(self, include_duplicates: bool = False) -> pd.DataFrame:
+        """Return a DataFrame shaped for ``CalendarDatasource`` video overlay rendering."""
+        columns = [
+            "video_path",
+            "filename",
+            "category",
+            "recording_datetime",
+            "recording_day_date",
+            "duration_sec",
+            "first_timestamp_rel",
+            "duration_rel",
+            "is_duplicate",
+            "is_canonical",
+            "consolidated_path",
+        ]
+        df = self.load_videos_df()
+        if df.empty:
+            return pd.DataFrame(columns=columns)
+        if not include_duplicates and "is_duplicate" in df.columns:
+            df = df.loc[~df["is_duplicate"]].copy()
+        if df.empty:
+            return pd.DataFrame(columns=columns)
+
+        rec_dts: List[Optional[datetime]] = []
+        day_dts: List[Optional[datetime]] = []
+        first_rels: List[float] = []
+        dur_rels: List[float] = []
+        for row in df.itertuples():
+            raw_start = getattr(row, "start_datetime", None)
+            dt_val: Optional[datetime] = None
+            if raw_start is not None and pd.notna(raw_start):
+                if isinstance(raw_start, pd.Timestamp):
+                    dt_val = raw_start.to_pydatetime()
+                elif isinstance(raw_start, datetime):
+                    dt_val = raw_start
+            if dt_val is not None:
+                if dt_val.tzinfo is None:
+                    dt_val = dt_val.replace(tzinfo=timezone.utc)
+                else:
+                    dt_val = dt_val.astimezone(timezone.utc)
+                day_start = dt_val.replace(hour=0, minute=0, second=0, microsecond=0)
+                first_rel = float((dt_val - day_start).total_seconds()) / (24.0 * 3600.0)
+            else:
+                day_start = None
+                first_rel = 0.1
+            dur = getattr(row, "duration_sec", None)
+            if dur is not None and pd.notna(dur):
+                try:
+                    dur_rel = max(0.01, min(1.0, float(dur) / (24.0 * 3600.0)))
+                except (TypeError, ValueError):
+                    dur_rel = 0.03
+            else:
+                dur_rel = 0.03
+            rec_dts.append(dt_val)
+            day_dts.append(day_start)
+            first_rels.append(max(0.0, min(0.99, first_rel)))
+            dur_rels.append(dur_rel)
+        ## END for row in df.itertuples()....
+
+        out = pd.DataFrame(
+            {
+                "video_path": df["video_path"].values,
+                "filename": df["filename"].values,
+                "category": df["category"].values,
+                "recording_datetime": rec_dts,
+                "recording_day_date": day_dts,
+                "duration_sec": df["duration_sec"].values,
+                "first_timestamp_rel": first_rels,
+                "duration_rel": dur_rels,
+                "is_duplicate": df["is_duplicate"].values,
+                "is_canonical": df["is_canonical"].values,
+                "consolidated_path": df["consolidated_path"].values if "consolidated_path" in df.columns else None,
+            }
+        )
+        return out
+
+
     def load_duplicates_df(self) -> pd.DataFrame:
         df = self.load_videos_df()
         if df.empty or "duplicate_group_id" not in df.columns:

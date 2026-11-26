@@ -29,6 +29,12 @@
 		},
 		{
 			"path": "../continuous_video_recorder"
+		},
+		{
+			"path": "../emotiv-rs-recorder"
+		},
+		{
+			"path": "../App-LabRecorder"
 		}
 	],
 	"settings": {
@@ -62,12 +68,12 @@
 					"args": ["Analyze Run"]
 				},
 				{
-					"name": "$(calendar) Session Calendar",
-					"tooltip": "Open PyQt session calendar (discover into catalog, then browse)",
+					"name": "$(window) Offline Manager",
+					"tooltip": "Open Offline Analysis Manager (calendar, discovery, video catalog, process)",
 					"color": "#4FC3F7",
 					"useVsCodeApi": true,
 					"command": "workbench.action.tasks.runTask",
-					"args": ["Session Calendar"]
+					"args": ["Offline Manager"]
 				},
 				{
 					"name": "$(search) Discover Sessions",

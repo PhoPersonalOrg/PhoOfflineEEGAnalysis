@@ -1,74 +1,80 @@
-# Session calendar + discovery catalog
+# Offline Analysis Manager & Session Calendar
 
-Browse recorded LabRecorder XDF sessions on a PyQt month-grid calendar. A SQLite catalog is filled at discovery time and updated during `process_XDFs_main`.
+The primary PyQt GUI for offline EEG and video data management is **`OfflineAnalysisManagerWindow`**, which embeds the month-grid **`SessionCalendarPanel`** alongside session discovery, EEG processing, video catalog actions, and centralized path configuration.
 
-## Workflow
+## Launching the Manager
 
-### 1. Discover (no full EEG load)
-
-```python
-from pathlib import Path
-from phoofflineeeganalysis.analysis.session_catalog import get_or_create_catalog
-
-lab_dir = Path(r"E:/Dropbox (Personal)/Databases/UnparsedData/LabRecorderStudies/sub-P001")
-catalog = get_or_create_catalog()  # default: .../PICKLED_COLLECTION/session_catalog/sessions.sqlite
-n = catalog.discover_and_upsert(lab_dir)
-print(f"Upserted {n} sessions into {catalog.db_path}")
+```bash
+python run_offline_analysis_manager.py
+# or via installed console script:
+phoofflineeeganalysis
+# optional flags:
+phoofflineeeganalysis --discover
+phoofflineeeganalysis --config path/to/offline_analysis_paths.yaml
 ```
 
-### 2. Open the calendar
+`run_session_calendar.py` remains as a deprecation alias that launches the manager.
 
-```python
-from phoofflineeeganalysis.analysis.UI.CustomCalendarWidget import launch_session_calendar
+## Path Configuration (`AppPaths`)
 
-launch_session_calendar(discovery_dirs=[lab_dir])  # discover then show
-# or, if catalog already populated:
-# launch_session_calendar()
-```
+Committed defaults live in `config/offline_analysis_paths.yaml` (no hard-coded drive letters). Machine-specific overrides are stored in gitignored `config/offline_analysis_paths.local.yaml` (or edited in-app via **Config → Edit Paths...**), and can also be overridden via environment variables:
 
-Legacy import (notebooks): `from phoofflineeeganalysis.UI.CustomCalendarWidget import ...`
+- `PHO_LAB_RECORDER_DIRS` (`os.pathsep`-separated list)
+- `PHO_PICKLED_DATA_PATH`
+- `PHO_SESSION_CATALOG_PATH`
+- `PHO_VIDEO_CATALOG_PATH`
+- `PHO_VIDEO_SOURCES_YAML`
 
-### 3. Process via `main_analyze_run.py`
+## Manager Features
 
-Running `python main_analyze_run.py` (or its `__main__` block):
+- **Sessions → Discover / Refresh Catalog (`Ctrl+R`)**: runs `SessionCatalog.discover_and_upsert` on a background thread and refreshes the calendar.
+- **Sessions → Process Recent...**: runs `SpectogramPlottingHelper.process_XDFs_main(..., session_catalog=catalog, retain_in_memory=False)` on a background thread while polling the catalog every 2 seconds so status colors update live.
+- **Video → Ingest Video Metadata / Duplicate Report / Consolidate Videos...**: wraps `VideoCatalog` (`discover_and_upsert`, `recompute_duplicates`, duplicate summary, and `consolidate` with dry-run support) and refreshes the calendar video overlay.
+- **View → Show Video Overlay**: toggles category-colored video interval bars (`EyeRecordings`, `WebcamRecordings`, `ScreenRecordings`) on the calendar and video entries in the day detail list.
+- **Job Log Dock**: shows timestamped progress and errors from background jobs.
 
-1. Opens/creates the SQLite catalog under `PICKLED_COLLECTION/session_catalog/sessions.sqlite`
-2. Discovers all `.xdf` files under `lab_recorder_output_path` (`status=discovered`)
-3. Passes the catalog into `process_XDFs_main` — each file is marked `computing` → `computed` / `exported` / `failed`
-4. After exports, `sync_from_processed_batch` writes durations/`meas_date` and export paths into the catalog
-
-### 4. Refresh the calendar
-
-Re-open `launch_session_calendar()` (or rebuild `CalendarDatasource` from `catalog.load_calendar_dataframe()`) to see updated status colors:
+### Session Status Colors
 
 | Status | Color |
-|--------|--------|
+|--------|-------|
 | discovered | cornflower |
 | computing | amber |
 | computed | green |
 | exported | blue |
 | failed | red |
 
-Click a day to list sessions (time, status, filename, duration).
+Click a day to list EEG sessions and (when enabled) videos. Right-click a session for **Open in Timeline**, **Reveal in Explorer**, or **Copy Path**; right-click or double-click a video for **Reveal in Explorer** or **Copy Path**.
 
-### 5. Open a session in pyPhoTimeline (offline)
+## Opening a Session in `pyPhoTimeline` (offline)
 
-Double-click a session in the list, or select it and click **Open in Timeline**:
+Double-click an EEG session in the list, or select it and click **Open in Timeline**:
 
 1. If offline timeline is already running (listens on QLocalServer `pypho_timeline_offline`), the calendar sends `show_session` — the viewer **zooms** if that XDF is already loaded, otherwise **appends** it then zooms.
 2. If no timeline is running, it cold-starts `pyPhoTimeline/main_offline_timeline.py --show-session <xdf_path>`.
-3. When catalog `status` is `computed` or `exported`, handoff sets `--prefer-cached-spectrograms` / IPC `prefer_cached_spectrograms` so the viewer reuses feature-store HDF5 or `PICKLED_COLLECTION/computation_cache` `spectogram` pickles instead of recomputing STFT (falls back to compute on cache miss).
+3. When catalog `status` is `computed` or `exported`, handoff sets `--prefer-cached-spectrograms` / IPC `prefer_cached_spectrograms` so the viewer reuses cached spectrograms when available.
 
-A healthy offline viewer prints `Offline command server listening as 'pypho_timeline_offline'` after startup. Subsequent calendar clicks (and a second `--show-session` launch) forward over IPC instead of opening another window. If the server is up but `show_session` fails, the calendar reports an error and does **not** spawn another process.
+Optional: set `PYPHOTIMELINE_ROOT` if `pyPhoTimeline` is not the sibling `../pyPhoTimeline` under `ACTIVE_DEV`.
 
-Leave the Historical Timeline / offline viewer open for instant zoom on subsequent clicks.
+## Standalone Calendar Launch (Notebooks)
 
-Optional: set `PYPHOTIMELINE_ROOT` if pyPhoTimeline is not the sibling `../pyPhoTimeline` under `ACTIVE_DEV`.
+For notebook or script workflows that only need the calendar window without the manager shell:
 
-## API sketch
+```python
+from pathlib import Path
+from phoofflineeeganalysis.analysis.UI.CustomCalendarWidget import launch_session_calendar
 
-- `SessionCatalog.discover_and_upsert(dirs)`
-- `SessionCatalog.load_calendar_dataframe()`
-- `SessionCatalog.mark_computing` / `mark_computed` / `mark_exported` / `mark_failed`
-- `launch_session_calendar(catalog_path=..., discovery_dirs=...)`
+launch_session_calendar(discovery_dirs=[Path("path/to/sub-P001")])
+# or, if catalog is already populated:
+# launch_session_calendar()
+```
+
+Legacy import (notebooks): `from phoofflineeeganalysis.UI.CustomCalendarWidget import ...`
+
+## API Sketch
+
+- `AppPaths.load(...)` / `AppPaths.save(...)`
+- `SessionCatalog.discover_and_upsert(dirs)` / `load_calendar_dataframe()`
+- `VideoCatalog.discover_and_upsert(...)` / `load_calendar_dataframe()` / `consolidate(...)`
+- `SessionCalendarPanel` (embeddable widget) / `SessionCalendarWindow` / `launch_session_calendar(...)`
+- `OfflineAnalysisManagerWindow` / `launch_offline_analysis_manager(...)`
 - `open_session_in_timeline(xdf_path, start=..., duration_sec=...)` (IPC or spawn)

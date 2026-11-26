@@ -1,0 +1,20 @@
+# Centralized paths and defaults for the Offline Analysis Manager.
+# Put machine-specific overrides in config/offline_analysis_paths.local.yaml (gitignored)
+# or set environment variables:
+#   PHO_LAB_RECORDER_DIRS (os.pathsep-separated)
+#   PHO_PICKLED_DATA_PATH
+#   PHO_SESSION_CATALOG_PATH
+#   PHO_VIDEO_CATALOG_PATH
+#   PHO_VIDEO_SOURCES_YAML
+
+lab_recorder_dirs: []
+pickled_data_path: ""
+session_catalog_path: ""
+video_catalog_path: "output/video_catalog.sqlite"
+video_sources_yaml: "config/video_sources.yaml"
+
+process_defaults:
+  n_most_recent_sessions_to_preprocess: 5
+  should_write_final_merged_eeg_fif: true
+  use_computation_cache: true
+  absolute_max_workers: 2

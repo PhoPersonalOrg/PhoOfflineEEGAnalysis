@@ -112,10 +112,16 @@ def try_send_show_session(xdf_path: Union[str, Path], start: Any = None, end: An
     if _wait_for_socket_response(sock, timeout_ms):
         try:
             raw = bytes(sock.readAll()).decode("utf-8", errors="replace").strip()
-            line = raw.splitlines()[0] if raw else "{}"
+            if not raw:
+                sock.disconnectFromServer()
+                return True, True  # delivered; empty body means peer accepted without payload
+            line = raw.splitlines()[0]
             resp = json.loads(line)
             sock.disconnectFromServer()
-            return True, bool(resp.get("ok", False))
+            # Explicit rejection only; missing "ok" (or accepted:true ack) counts as delivered.
+            if "ok" in resp:
+                return True, bool(resp.get("ok"))
+            return True, True
         except Exception:
             sock.disconnectFromServer()
             return True, True

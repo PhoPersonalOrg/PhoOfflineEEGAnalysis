@@ -1,12 +1,15 @@
-"""Launch the PyQt session calendar backed by the discovery/compute catalog."""
+"""Deprecated alias that launches the Offline Analysis Manager.
 
-from pathlib import Path
+Use ``run_offline_analysis_manager.py`` or ``phoofflineeeganalysis`` directly.
+"""
 
-from phoofflineeeganalysis.analysis.UI.CustomCalendarWidget import launch_session_calendar
+from __future__ import annotations
 
-LAB_RECORDER_DIR = Path(r"E:/Dropbox (Personal)/Databases/UnparsedData/LabRecorderStudies/sub-P001")
-PICKLED_DATA_PATH = Path(r"E:/Dropbox (Personal)/Databases/AnalysisData/MNE_preprocessed/PICKLED_COLLECTION")
+import sys
+
+from run_offline_analysis_manager import main as _manager_main
+
 
 if __name__ == "__main__":
-	discovery_dirs = [LAB_RECORDER_DIR] if LAB_RECORDER_DIR.exists() else None
-	launch_session_calendar(discovery_dirs=discovery_dirs, pickled_data_path=PICKLED_DATA_PATH)
+    print("Note: run_session_calendar.py is deprecated; launching Offline Analysis Manager (run_offline_analysis_manager.py).", file=sys.stderr)
+    raise SystemExit(_manager_main())

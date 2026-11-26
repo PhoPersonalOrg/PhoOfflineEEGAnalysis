@@ -302,7 +302,8 @@ class SessionCatalog:
         if "xdf_dataset_idx" in tmp_df.columns:
             dataset_ids = tmp_df["xdf_dataset_idx"].drop_duplicates().tolist()
         else:
-            dataset_ids = list(range(len(active_only_out_eeg_raws)))
+            n_fallback = len(active_only_out_eeg_raws) if active_only_out_eeg_raws is not None else len(tmp_df)
+            dataset_ids = list(range(n_fallback))
 
         n_updated = 0
         for dataset_idx in dataset_ids:
@@ -325,7 +326,7 @@ class SessionCatalog:
             raw = None
             try:
                 raw_idx = int(dataset_idx)
-                if 0 <= raw_idx < len(active_only_out_eeg_raws):
+                if active_only_out_eeg_raws is not None and 0 <= raw_idx < len(active_only_out_eeg_raws):
                     raw = active_only_out_eeg_raws[raw_idx]
             except (TypeError, ValueError):
                 raw = None
@@ -338,6 +339,20 @@ class SessionCatalog:
                     duration_sec = float(raw.n_times) / float(raw.info["sfreq"]) if raw.info.get("sfreq") else None
                 except Exception:
                     duration_sec = None
+            else:
+                # Streaming Analyze Run: Raw lists are empty; use columns written onto stream_infos
+                if "recording_datetime" in rows.columns and pd.notna(row.get("recording_datetime")):
+                    meas_date = row.get("recording_datetime")
+                    if isinstance(meas_date, str):
+                        try:
+                            meas_date = datetime.fromisoformat(meas_date.replace("Z", "+00:00"))
+                        except Exception:
+                            meas_date = None
+                if "eeg_duration_sec" in rows.columns and pd.notna(row.get("eeg_duration_sec")):
+                    try:
+                        duration_sec = float(row.get("eeg_duration_sec"))
+                    except Exception:
+                        duration_sec = None
 
             fif_path = None
             mat_path = None
