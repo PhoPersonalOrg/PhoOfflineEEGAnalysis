@@ -1,0 +1,13 @@
+---
+description: Do not use OpenSpec for this project
+alwaysApply: true
+---
+
+# No OpenSpec
+
+This project does **not** use OpenSpec.
+
+- Do not create or update `openspec/` directories, proposals, specs, tasks, or design docs.
+- Do not run `openspec` CLI commands (`init`, `validate`, `archive`, etc.).
+- Do not scaffold OpenSpec change IDs or reference OpenSpec workflows for planning or implementation.
+- For planning, use Cursor plans / normal design discussion; implement features directly without an OpenSpec Stage 1 gate.
