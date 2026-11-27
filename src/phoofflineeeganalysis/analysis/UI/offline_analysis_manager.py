@@ -4,17 +4,19 @@ Hosts ``SessionCalendarPanel`` as its central view and integrates:
 - Session discovery / catalog refresh (``SessionCatalog``)
 - Video metadata ingest / duplicate report / consolidate (``VideoCatalog``)
 - Toggleable video overlay on the session calendar
-- Background EEG processing (``SpectogramPlottingHelper.process_XDFs_main``) with live status polling
+- Background EEG processing (``SpectogramPlottingHelper.process_XDFs_main``) with live progress,
+  active-session labels, catalog status polling, and cooperative cancel
 - Centralized path configuration (``AppPaths`` / ``config/offline_analysis_paths.yaml``)
 """
 
 from __future__ import annotations
 
 import sys
+import threading
 import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 
 import pandas as pd
 from PyQt5.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal
@@ -33,6 +35,7 @@ from PyQt5.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QSpinBox,
     QToolBar,
@@ -50,16 +53,28 @@ class _CallableWorker(QObject):
     """Run a Python callable on a background ``QThread``."""
 
     progress = pyqtSignal(str)
+    progress_detail = pyqtSignal(object)  # dict: message/current/total/active_sessions
     finished = pyqtSignal(object)
     failed = pyqtSignal(str)
 
-    def __init__(self, fn: Callable[[Callable[[str], None]], Any]):
+    def __init__(self, fn: Callable[[Callable[..., None]], Any]):
         super().__init__()
         self._fn = fn
 
     def run(self) -> None:
         try:
-            result = self._fn(self.progress.emit)
+            def _emit(message: str, *, current: Optional[int] = None, total: Optional[int] = None, active_sessions: Optional[Sequence[str]] = None) -> None:
+                self.progress.emit(str(message))
+                detail: Dict[str, Any] = {"message": str(message)}
+                if current is not None:
+                    detail["current"] = int(current)
+                if total is not None:
+                    detail["total"] = int(total)
+                if active_sessions is not None:
+                    detail["active_sessions"] = [str(s) for s in active_sessions]
+                self.progress_detail.emit(detail)
+
+            result = self._fn(_emit)
             self.finished.emit(result)
         except Exception:
             self.failed.emit(traceback.format_exc())
@@ -247,7 +262,11 @@ class OfflineAnalysisManagerWindow(QMainWindow):
 
         self._active_thread: Optional[QThread] = None
         self._active_worker: Optional[_CallableWorker] = None
+        self._cancel_event: Optional[threading.Event] = None
+        self._last_job_cancelled: bool = False
+        self._job_cancelable: bool = False
         self._job_actions: List[QAction] = []
+        self._job_name: str = ""
 
         self.setWindowTitle("Pho Offline Analysis Manager")
         self.resize(1120, 700)
@@ -270,6 +289,27 @@ class OfflineAnalysisManagerWindow(QMainWindow):
         container = QWidget(self.job_log_dock)
         vbox = QVBoxLayout(container)
         vbox.setContentsMargins(4, 4, 4, 4)
+
+        progress_row = QHBoxLayout()
+        self.job_progress_bar = QProgressBar(container)
+        self.job_progress_bar.setMinimum(0)
+        self.job_progress_bar.setMaximum(0)  # indeterminate until total known
+        self.job_progress_bar.setValue(0)
+        self.job_progress_bar.setTextVisible(True)
+        self.job_progress_bar.setFormat("Idle")
+        progress_row.addWidget(self.job_progress_bar, stretch=1)
+
+        self.btn_cancel_job = QPushButton("Cancel", container)
+        self.btn_cancel_job.setEnabled(False)
+        self.btn_cancel_job.setToolTip("Cancel the running job after in-flight session(s) finish")
+        self.btn_cancel_job.clicked.connect(self.on_cancel_job)
+        progress_row.addWidget(self.btn_cancel_job)
+        vbox.addLayout(progress_row)
+
+        self.job_progress_label = QLabel("No job running.", container)
+        self.job_progress_label.setWordWrap(True)
+        self.job_progress_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        vbox.addWidget(self.job_progress_label)
 
         self.job_log = QPlainTextEdit(container)
         self.job_log.setReadOnly(True)
@@ -296,6 +336,12 @@ class OfflineAnalysisManagerWindow(QMainWindow):
         self.action_process_sessions = QAction("Process Recent...", self)
         self.action_process_sessions.triggered.connect(self.on_process_sessions)
         sessions_menu.addAction(self.action_process_sessions)
+
+        self.action_cancel_job = QAction("Cancel Running Job", self)
+        self.action_cancel_job.setShortcut("Esc")
+        self.action_cancel_job.setEnabled(False)
+        self.action_cancel_job.triggered.connect(self.on_cancel_job)
+        sessions_menu.addAction(self.action_cancel_job)
 
         sessions_menu.addSeparator()
         self.action_reload_catalogs = QAction("Reload Catalogs From Disk", self)
@@ -363,10 +409,69 @@ class OfflineAnalysisManagerWindow(QMainWindow):
             action.setEnabled(not running)
         ## END for action in self._job_actions....
 
-        if running and label:
+        cancel_enabled = running and self._job_cancelable
+        self.btn_cancel_job.setEnabled(cancel_enabled)
+        self.action_cancel_job.setEnabled(cancel_enabled)
+        if running:
+            self._job_name = label or self._job_name
+            self.job_progress_bar.setMaximum(0)
+            self.job_progress_bar.setValue(0)
+            self.job_progress_bar.setFormat("%p% — working...")
+            self.job_progress_label.setText(f"Running: {label}..." if label else "Running...")
             self.statusBar().showMessage(f"Running: {label}...")
-        elif not running and label:
-            self.statusBar().showMessage(label, 5000)
+        else:
+            self.job_progress_bar.setMaximum(1)
+            self.job_progress_bar.setValue(1 if label else 0)
+            self.job_progress_bar.setFormat("Idle" if not label else "Done")
+            if label:
+                self.job_progress_label.setText(label)
+                self.statusBar().showMessage(label, 5000)
+            else:
+                self.job_progress_label.setText("No job running.")
+            self._job_name = ""
+
+    def _on_progress_detail(self, detail: object) -> None:
+        if not isinstance(detail, dict):
+            return
+        current = detail.get("current")
+        total = detail.get("total")
+        active = detail.get("active_sessions") or []
+        message = str(detail.get("message") or "")
+
+        if isinstance(total, int) and total > 0 and isinstance(current, int):
+            self.job_progress_bar.setMaximum(total)
+            self.job_progress_bar.setValue(max(0, min(current, total)))
+            self.job_progress_bar.setFormat(f"%v/%m sessions (%p%)")
+        elif isinstance(total, int) and total == 0:
+            self.job_progress_bar.setMaximum(1)
+            self.job_progress_bar.setValue(1)
+            self.job_progress_bar.setFormat("No sessions")
+
+        active_txt = ", ".join(active) if active else "(none)"
+        parts = []
+        if self._job_name:
+            parts.append(self._job_name)
+        if isinstance(current, int) and isinstance(total, int) and total > 0:
+            parts.append(f"{current}/{total} done")
+        parts.append(f"active: {active_txt}")
+        if message and message not in parts:
+            parts.append(message)
+        self.job_progress_label.setText(" — ".join(parts))
+        if active:
+            self.statusBar().showMessage(f"{self._job_name}: {', '.join(active)}")
+
+    def on_cancel_job(self) -> None:
+        if self._cancel_event is None or self._active_thread is None:
+            return
+        if self._cancel_event.is_set():
+            self.log("Cancel already requested; waiting for in-flight work to finish...")
+            return
+        self._cancel_event.set()
+        self.btn_cancel_job.setEnabled(False)
+        self.btn_cancel_job.setText("Cancelling...")
+        self.log(f"Cancel requested for job: {self._job_name or '(unnamed)'}")
+        self.job_progress_label.setText(f"Cancelling {self._job_name or 'job'}… in-flight session(s) will finish, pending sessions skipped.")
+        self.statusBar().showMessage("Cancelling job...")
 
     def reload_catalogs(self) -> None:
         """Open configured ``SessionCatalog`` and ``VideoCatalog`` and refresh the calendar."""
@@ -395,15 +500,26 @@ class OfflineAnalysisManagerWindow(QMainWindow):
             sessions_df = self.session_catalog.load_calendar_dataframe()
             video_df = self.calendar_panel.calendar.datasource.video_infos_df if self.calendar_panel.calendar.datasource is not None else None
             self.calendar_panel.set_datasource(CalendarDatasource(xdf_stream_infos_df=sessions_df, video_infos_df=video_df))
+            if self._active_thread is not None and "status" in sessions_df.columns:
+                computing = sessions_df.loc[sessions_df["status"].astype(str).str.lower() == "computing", "xdf_filename"]
+                names = [str(n) for n in computing.tolist() if n]
+                if names:
+                    done_hint = self.job_progress_bar.value()
+                    total_hint = self.job_progress_bar.maximum()
+                    progress_bit = f"{done_hint}/{total_hint} done — " if total_hint > 0 else ""
+                    self.job_progress_label.setText(f"{self._job_name}: {progress_bit}computing: {', '.join(names)}")
         except Exception:
             pass
 
-    def _run_job(self, name: str, fn: Callable[[Callable[[str], None]], Any], on_success: Callable[[Any], None], poll_catalog: bool = False) -> None:
+    def _run_job(self, name: str, fn: Callable[[Callable[..., None]], Any], on_success: Callable[[Any], None], poll_catalog: bool = False, cancelable: bool = False) -> None:
         if self._active_thread is not None:
             QMessageBox.information(self, "Job In Progress", "Another background job is currently running. Wait for it to finish.")
             return
 
         self.log(f"Started: {name}")
+        self._cancel_event = threading.Event()
+        self._job_cancelable = bool(cancelable)
+        self.btn_cancel_job.setText("Cancel")
         self._set_job_running(True, name)
 
         thread = QThread(self)
@@ -419,21 +535,28 @@ class OfflineAnalysisManagerWindow(QMainWindow):
             thread.deleteLater()
             self._active_thread = None
             self._active_worker = None
+            self._cancel_event = None
+            self._job_cancelable = False
+            self.btn_cancel_job.setText("Cancel")
 
         def _handle_finished(result: Any) -> None:
+            self._last_job_cancelled = bool(cancelable and self._cancel_event is not None and self._cancel_event.is_set())
             _cleanup()
             try:
                 on_success(result)
             finally:
-                self._set_job_running(False, f"Finished: {name}")
+                suffix = "Cancelled" if self._last_job_cancelled else "Finished"
+                self._set_job_running(False, f"{suffix}: {name}")
 
         def _handle_failed(err_tb: str) -> None:
+            self._last_job_cancelled = False
             _cleanup()
             self.log(f"FAILED ({name}):\n{err_tb}")
             self._set_job_running(False, f"Failed: {name}")
             QMessageBox.warning(self, f"{name} Failed", err_tb.splitlines()[-1] if err_tb else "Unknown error")
 
         worker.progress.connect(self.log)
+        worker.progress_detail.connect(self._on_progress_detail)
         worker.finished.connect(_handle_finished)
         worker.failed.connect(_handle_failed)
         thread.started.connect(worker.run)
@@ -470,14 +593,19 @@ class OfflineAnalysisManagerWindow(QMainWindow):
         catalog = self.session_catalog or get_or_create_catalog(db_path=self.paths.resolved_session_catalog_path(), pickled_data_path=self.paths.pickled_data_path)
         self.session_catalog = catalog
 
-        def _work(progress: Callable[[str], None]) -> Any:
+        def _work(progress: Callable[..., None]) -> Any:
             repo_root = str(default_repo_root())
             if repo_root not in sys.path:
                 sys.path.insert(0, repo_root)
             progress("Importing main_analyze_run.SpectogramPlottingHelper...")
             from main_analyze_run import SpectogramPlottingHelper
 
-            progress(f"Running process_XDFs_main (n_recent={params['n_most_recent_sessions_to_preprocess']}, workers={params['absolute_max_workers']})...")
+            progress(
+                f"Running process_XDFs_main (n_recent={params['n_most_recent_sessions_to_preprocess']}, workers={params['absolute_max_workers']})...",
+                current=0,
+                total=0,
+                active_sessions=[],
+            )
             return SpectogramPlottingHelper.process_XDFs_main(
                 n_most_recent_sessions_to_preprocess=params["n_most_recent_sessions_to_preprocess"],
                 should_write_final_merged_eeg_fif=params["should_write_final_merged_eeg_fif"],
@@ -487,13 +615,15 @@ class OfflineAnalysisManagerWindow(QMainWindow):
                 session_catalog=catalog,
                 use_session_catalog=True,
                 retain_in_memory=False,
+                progress_callback=progress,
+                cancel_event=self._cancel_event,
             )
 
         def _done(_result: Any) -> None:
-            self.log("EEG processing finished.")
+            self.log("EEG processing cancelled." if self._last_job_cancelled else "EEG processing finished.")
             self.reload_catalogs()
 
-        self._run_job("Process EEG Sessions", _work, _done, poll_catalog=True)
+        self._run_job("Process EEG Sessions", _work, _done, poll_catalog=True, cancelable=True)
 
     def on_video_ingest(self) -> None:
         sources_yaml = self.paths.video_sources_yaml
@@ -595,6 +725,8 @@ class OfflineAnalysisManagerWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._poll_timer.stop()
+        if self._cancel_event is not None:
+            self._cancel_event.set()
         if self._active_thread is not None and self._active_thread.isRunning():
             self._active_thread.quit()
             self._active_thread.wait(2000)

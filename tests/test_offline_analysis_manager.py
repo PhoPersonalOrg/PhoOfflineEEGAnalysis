@@ -137,3 +137,84 @@ def test_manager_window_and_video_overlay(tmp_path: Path) -> None:
 
     win.close()
     app.processEvents()
+
+
+def test_manager_progress_widgets_and_cancel_event(tmp_path: Path) -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import threading
+    import time
+
+    from PyQt5.QtWidgets import QApplication
+
+    from phoofflineeeganalysis.analysis.UI.offline_analysis_manager import OfflineAnalysisManagerWindow
+    from phoofflineeeganalysis.analysis.app_paths import AppPaths
+
+    app = QApplication.instance() or QApplication([])
+    paths = AppPaths(
+        lab_recorder_dirs=[tmp_path],
+        session_catalog_path=tmp_path / "sessions.sqlite",
+        video_catalog_path=tmp_path / "videos.sqlite",
+        video_sources_yaml=tmp_path / "video_sources.yaml",
+        local_yaml_path=tmp_path / "offline_analysis_paths.local.yaml",
+    )
+    win = OfflineAnalysisManagerWindow(paths=paths)
+
+    assert win.job_progress_bar is not None
+    assert win.job_progress_label.text() == "No job running."
+    assert not win.btn_cancel_job.isEnabled()
+    assert not win.action_cancel_job.isEnabled()
+
+    started = threading.Event()
+    finished = threading.Event()
+
+    def _work(progress) -> str:
+        progress("hello", current=1, total=4, active_sessions=["ses_a.xdf"])
+        started.set()
+        while win._cancel_event is not None and not win._cancel_event.is_set():
+            time.sleep(0.02)
+        ## END while win._cancel_event is not None and not win._cancel_event.is_set()...
+        progress("cancelled path", current=1, total=4, active_sessions=[])
+        finished.set()
+        return "ok"
+
+    def _done(result: str) -> None:
+        assert result == "ok"
+
+    win._run_job("Test Job", _work, _done, cancelable=True)
+    app.processEvents()
+    assert win.btn_cancel_job.isEnabled()
+    assert win.action_cancel_job.isEnabled()
+
+    deadline = time.time() + 3.0
+    while not started.is_set() and time.time() < deadline:
+        app.processEvents()
+        time.sleep(0.02)
+    ## END while not started.is_set() and time.time() < deadline...
+    assert started.is_set()
+
+    # Drain queued progress_detail signals from the worker thread
+    deadline = time.time() + 2.0
+    while win.job_progress_bar.maximum() != 4 and time.time() < deadline:
+        app.processEvents()
+        time.sleep(0.02)
+    ## END while win.job_progress_bar.maximum() != 4 and time.time() < deadline...
+    assert win.job_progress_bar.maximum() == 4
+    assert win.job_progress_bar.value() == 1
+    assert "ses_a.xdf" in win.job_progress_label.text()
+
+    win.on_cancel_job()
+    assert win._cancel_event is not None and win._cancel_event.is_set()
+    assert win.btn_cancel_job.text() == "Cancelling..."
+
+    deadline = time.time() + 5.0
+    while win._active_thread is not None and time.time() < deadline:
+        app.processEvents()
+        time.sleep(0.02)
+    ## END while win._active_thread is not None and time.time() < deadline...
+    assert finished.is_set()
+    assert win._last_job_cancelled is True
+    assert not win.btn_cancel_job.isEnabled()
+    assert "Cancelled" in win.job_progress_label.text()
+
+    win.close()
+    app.processEvents()

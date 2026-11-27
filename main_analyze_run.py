@@ -1461,7 +1461,7 @@ class SpectogramPlottingHelper:
 
 
 	@classmethod
-	def process_XDFs_main(cls, n_most_recent_sessions_to_preprocess: Optional[int] = 5, should_write_final_merged_eeg_fif: bool = True, included_xdf_file_names: Optional[List]=None, should_load_preprocessed: bool = False, use_computation_cache: bool = True, cache_root: Optional[Path] = None, use_mtime_in_cache_key: bool = False, use_graph_computation_cache: bool = False, absolute_max_workers: int = 2, session_catalog: Optional[SessionCatalog] = None, use_session_catalog: bool = True, retain_in_memory: bool = True, session_sink: Optional[Callable[[int, Any, Any, Any, Any], None]] = None):
+	def process_XDFs_main(cls, n_most_recent_sessions_to_preprocess: Optional[int] = 5, should_write_final_merged_eeg_fif: bool = True, included_xdf_file_names: Optional[List]=None, should_load_preprocessed: bool = False, use_computation_cache: bool = True, cache_root: Optional[Path] = None, use_mtime_in_cache_key: bool = False, use_graph_computation_cache: bool = False, absolute_max_workers: int = 2, session_catalog: Optional[SessionCatalog] = None, use_session_catalog: bool = True, retain_in_memory: bool = True, session_sink: Optional[Callable[[int, Any, Any, Any, Any], None]] = None, progress_callback: Optional[Callable[..., None]] = None, cancel_event: Optional[threading.Event] = None):
 		""" Processes a single .xdf file independently to produce all exports
 
 			from PhoOfflineEEGAnalysis.main_analyze_run import SpectogramPlottingHelper
@@ -1472,6 +1472,9 @@ class SpectogramPlottingHelper:
 			When *use_session_catalog* is True, discovery and per-file processing status are upserted into a SQLite session catalog (default under ``pickled_data_path/session_catalog``).
 
 			*retain_in_memory* (default True) keeps every session's Raw + computation result in the returned lists (batch / notebook behavior). Set False for streaming Analyze Run: after optional *session_sink(idx, eeg_raw, motion_raw, stream_infos, result)*, heavy objects are dropped and empty Raw/result lists are returned (stream_infos_df is still populated).
+
+			*progress_callback* may be called as ``progress_callback(message, current=i, total=n, active_sessions=[...])``.
+			*cancel_event*: when set, pending (not-yet-started) futures are cancelled; in-flight sessions finish, then the batch returns early.
 
 		"""
 		if cache_root is None:
@@ -1532,21 +1535,61 @@ class SpectogramPlottingHelper:
 		cpu_count: int = (os.cpu_count() or 2)
 		absolute_max_workers = min(absolute_max_workers, cpu_count)
 		max_workers = min(len(lab_recorder_xdf_files), absolute_max_workers)
-		print(f"Processing {len(lab_recorder_xdf_files)} XDF files using {max_workers} parallel workers...")
+		n_files_to_process: int = len(lab_recorder_xdf_files)
+		print(f"Processing {n_files_to_process} XDF files using {max_workers} parallel workers...")
+
+		def _emit_progress(message: str, *, current: Optional[int] = None, total: Optional[int] = None, active_sessions: Optional[List[str]] = None) -> None:
+			print(message)
+			if progress_callback is None:
+				return
+			kwargs: Dict[str, Any] = {}
+			if current is not None:
+				kwargs["current"] = current
+			if total is not None:
+				kwargs["total"] = total
+			if active_sessions is not None:
+				kwargs["active_sessions"] = list(active_sessions)
+			try:
+				progress_callback(message, **kwargs)
+			except TypeError:
+				progress_callback(message)
+
+		def _is_cancelled() -> bool:
+			return cancel_event is not None and cancel_event.is_set()
+
+		_emit_progress(f"Processing {n_files_to_process} XDF files using {max_workers} parallel workers...", current=0, total=n_files_to_process, active_sessions=[])
 
 		# Initialize result containers
-		_out_eeg_raw = [None] * len(lab_recorder_xdf_files)
-		_out_motion_raw = [None] * len(lab_recorder_xdf_files)
-		_out_xdf_stream_infos_df = [None] * len(lab_recorder_xdf_files)
-		_out_results = [None] * len(lab_recorder_xdf_files)
-
+		_out_eeg_raw = [None] * n_files_to_process
+		_out_motion_raw = [None] * n_files_to_process
+		_out_xdf_stream_infos_df = [None] * n_files_to_process
+		_out_results = [None] * n_files_to_process
+		_active_session_names: Set[str] = set()
+		_active_sessions_lock = threading.Lock()
+		_completed_count = 0
+		_completed_lock = threading.Lock()
 
 		def _subfn_process_single_xdf_file(idx_file_tuple):
 			"""Process a single XDF file - captures lots of things 
 			"""
+			nonlocal _completed_count
 			an_xdf_file_idx, a_xdf_file = idx_file_tuple
+			if _is_cancelled():
+				with _completed_lock:
+					_completed_count += 1
+					done_so_far = _completed_count
+				_emit_progress(f'Cancelled before start: "{a_xdf_file.name}"', current=done_so_far, total=n_files_to_process, active_sessions=sorted(_active_session_names))
+				if catalog is not None:
+					catalog.mark_failed(a_xdf_file, error="cancelled")
+				return an_xdf_file_idx, None, None, None, None
 			try:
-				print(f'  Processing XDF file {an_xdf_file_idx+1}/{len(lab_recorder_xdf_files)}: "{a_xdf_file.name}"...')
+				session_label = a_xdf_file.name
+				with _active_sessions_lock:
+					_active_session_names.add(session_label)
+					active_snapshot = sorted(_active_session_names)
+				with _completed_lock:
+					done_so_far = _completed_count
+				_emit_progress(f'Processing XDF file {an_xdf_file_idx+1}/{n_files_to_process}: "{session_label}"...', current=done_so_far, total=n_files_to_process, active_sessions=active_snapshot)
 				if catalog is not None:
 					catalog.mark_computing(a_xdf_file)
 
@@ -1558,21 +1601,28 @@ class SpectogramPlottingHelper:
 
 				eeg_raws = raws_dict.get(DataModalityType.EEG.value, [])
 
-				if len(eeg_raws) == 0:
-					print(f'  WARN: no EEG streams found in "{a_xdf_file.as_posix()}". Skipping file.')
+				def _finish_skipped(reason: str):
+					nonlocal _completed_count
+					with _active_sessions_lock:
+						_active_session_names.discard(session_label)
+						active_snapshot = sorted(_active_session_names)
+					with _completed_lock:
+						_completed_count += 1
+						done_so_far = _completed_count
+					_emit_progress(f'Skipped "{session_label}": {reason}', current=done_so_far, total=n_files_to_process, active_sessions=active_snapshot)
 					if catalog is not None:
-						catalog.mark_failed(a_xdf_file, error="no EEG streams found")
+						catalog.mark_failed(a_xdf_file, error=reason)
 					return an_xdf_file_idx, None, None, None, None
+
+				if len(eeg_raws) == 0:
+					return _finish_skipped("no EEG streams found")
 
 				# Merge by device so we can handle multiple EEG streams per XDF
 				merged_eeg_raws, merge_meta = LabRecorderXDF.merge_eeg_streams_by_device(
 					eeg_raws=eeg_raws, strict_merge=False, debug_print=False
 				)
 				if len(merged_eeg_raws) == 0:
-					print(f'  WARN: could not produce any merged EEG datasets for "{a_xdf_file.as_posix()}". Skipping file.')
-					if catalog is not None:
-						catalog.mark_failed(a_xdf_file, error="could not produce merged EEG datasets")
-					return an_xdf_file_idx, None, None, None, None
+					return _finish_skipped("could not produce merged EEG datasets")
 
 				# Save post-processed data if requested (one set per merged dataset)
 				exports_dict = None
@@ -1665,16 +1715,30 @@ class SpectogramPlottingHelper:
 				except Exception:
 					pass
 
-				print(f'  Completed XDF file {an_xdf_file_idx+1}/{len(lab_recorder_xdf_files)}: "{a_xdf_file.name}"')
+				with _active_sessions_lock:
+					_active_session_names.discard(session_label)
+					active_snapshot = sorted(_active_session_names)
+				with _completed_lock:
+					_completed_count += 1
+					done_so_far = _completed_count
+				_emit_progress(f'Completed XDF file {an_xdf_file_idx+1}/{n_files_to_process}: "{session_label}"', current=done_so_far, total=n_files_to_process, active_sessions=active_snapshot)
 				return an_xdf_file_idx, eeg_raw, motion_raw, stream_infos, result
 
 			except (ValueError, KeyError, AssertionError, TypeError) as e:
-				print(f'  ERROR in XDF file {an_xdf_file_idx+1}: {e}\n  Skipping file.')
+				with _active_sessions_lock:
+					_active_session_names.discard(a_xdf_file.name)
+					active_snapshot = sorted(_active_session_names)
+				with _completed_lock:
+					_completed_count += 1
+					done_so_far = _completed_count
+				_emit_progress(f'ERROR in XDF file {an_xdf_file_idx+1}: {e} (skipping)', current=done_so_far, total=n_files_to_process, active_sessions=active_snapshot)
 				if catalog is not None:
 					catalog.mark_failed(a_xdf_file, error=str(e))
 				return an_xdf_file_idx, None, None, None, None
 
 			except Exception as e:
+				with _active_sessions_lock:
+					_active_session_names.discard(a_xdf_file.name)
 				print(f'  EXCEPTION in XDF file {an_xdf_file_idx+1}: {e}')
 				if catalog is not None:
 					catalog.mark_failed(a_xdf_file, error=str(e))
@@ -1685,16 +1749,34 @@ class SpectogramPlottingHelper:
 		#                 Parallel processing using ThreadPoolExecutor                 #
 		# ---------------------------------------------------------------------------- #
 		completed_sessions = 0
+		was_cancelled = False
 		with ThreadPoolExecutor(max_workers=max_workers) as executor:
 			# Submit all tasks
 			future_to_idx = {
-				executor.submit(_subfn_process_single_xdf_file, (idx, xdf_file)): idx 
+				executor.submit(_subfn_process_single_xdf_file, (idx, xdf_file)): (idx, xdf_file)
 				for idx, xdf_file in enumerate(lab_recorder_xdf_files)
 			}
-			
+
 			# Collect results as they complete
 			for future in as_completed(future_to_idx):
+				if _is_cancelled() and not was_cancelled:
+					was_cancelled = True
+					_emit_progress("Cancel requested — finishing in-flight sessions and skipping pending...", current=_completed_count, total=n_files_to_process, active_sessions=sorted(_active_session_names))
+					for pending_future, (pending_idx, pending_path) in future_to_idx.items():
+						if pending_future.done():
+							continue
+						if pending_future.cancel():
+							if catalog is not None:
+								catalog.mark_failed(pending_path, error="cancelled")
+							_out_eeg_raw[pending_idx] = None
+							_out_motion_raw[pending_idx] = None
+							_out_xdf_stream_infos_df[pending_idx] = None
+							_out_results[pending_idx] = None
+					## END for pending_future, (pending_idx, pending_path) in future_to_idx.items()...
+
 				try:
+					if future.cancelled():
+						continue
 					idx, eeg_raw, motion_raw, stream_infos, result = future.result()
 					_out_xdf_stream_infos_df[idx] = stream_infos
 					if session_sink is not None and eeg_raw is not None and stream_infos is not None:
@@ -1717,13 +1799,18 @@ class SpectogramPlottingHelper:
 						if completed_sessions % 4 == 0:
 							gc.collect()
 				except Exception as e:
-					idx = future_to_idx[future]
+					idx, _xdf_path = future_to_idx[future]
 					print(f"  EXCEPTION collecting result for file {idx+1}: {e}")
 					_out_eeg_raw[idx] = None
 					_out_motion_raw[idx] = None
 					_out_xdf_stream_infos_df[idx] = None
 					_out_results[idx] = None
 			## END for future in as_completed(future_to_idx)...
+
+		if was_cancelled:
+			_emit_progress(f"Cancelled after {_completed_count}/{n_files_to_process} session(s).", current=_completed_count, total=n_files_to_process, active_sessions=[])
+		else:
+			_emit_progress(f"Finished processing {_completed_count}/{n_files_to_process} session(s).", current=_completed_count, total=n_files_to_process, active_sessions=[])
 
 		# Filter out failed files (valid = have stream_infos; Raw required only when retaining)
 		if retain_in_memory:
