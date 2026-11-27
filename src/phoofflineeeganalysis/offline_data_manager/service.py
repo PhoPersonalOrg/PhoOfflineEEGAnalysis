@@ -250,6 +250,50 @@ class OfflineDataManagerService:
         return self.media_catalog.consolidate(dest_root=resolved_dest, dry_run=dry_run, only_canonical=only_canonical)
 
 
+    def get_compute_options(self) -> Dict[str, Any]:
+        """Return a copy of the active computation options."""
+        return dict(self.paths.process_defaults)
+
+
+    def update_compute_options(self, options: Dict[str, Any], *, persist: bool = True) -> Dict[str, Any]:
+        """Update current computation options on ``self.paths.process_defaults`` (and persist to local YAML when requested)."""
+        allowed_keys = {
+            "n_most_recent_sessions_to_preprocess",
+            "should_write_final_merged_eeg_fif",
+            "use_computation_cache",
+            "use_mtime_in_cache_key",
+            "should_load_preprocessed",
+            "absolute_max_workers",
+        }
+        for key, val in options.items():
+            if key in allowed_keys:
+                self.paths.process_defaults[key] = val
+        ## END for key, val in options.items()...
+
+        if persist:
+            try:
+                self.paths.save()
+            except Exception:
+                pass
+        return dict(self.paths.process_defaults)
+
+
+    def compute_session(self, record_or_path: Union[Dict[str, Any], str, Path], *, progress: Optional[Callable[..., None]] = None, cancel_event: Optional[threading.Event] = None, **option_overrides: Any) -> Any:
+        """Compute a single selected ``.xdf`` session using the current computation options (plus any *option_overrides*)."""
+        if isinstance(record_or_path, dict):
+            raw_path = record_or_path.get("xdf_path") or record_or_path.get("path")
+        else:
+            raw_path = record_or_path
+        if not raw_path:
+            raise ValueError("Selected session has no .xdf file path")
+        xdf_path = Path(str(raw_path))
+        call_kwargs: Dict[str, Any] = dict(option_overrides)
+        call_kwargs["n_most_recent_sessions_to_preprocess"] = None
+        call_kwargs["included_xdf_paths"] = [xdf_path]
+        call_kwargs["included_xdf_file_names"] = [xdf_path.name]
+        return self.process_sessions(progress=progress, cancel_event=cancel_event, **call_kwargs)
+
+
     def process_sessions(self, *, progress: Optional[Callable[..., None]] = None, cancel_event: Optional[threading.Event] = None, **process_kwargs: Any) -> Any:
         """Run ``SpectogramPlottingHelper.process_XDFs_main`` wired to ``self.session_catalog``."""
         merged = dict(self.paths.process_defaults)
@@ -261,9 +305,13 @@ class OfflineDataManagerService:
             progress("Importing main_analyze_run.SpectogramPlottingHelper...")
         from main_analyze_run import SpectogramPlottingHelper
 
+        raw_paths = merged.get("included_xdf_paths")
+        resolved_paths = [Path(p) for p in raw_paths] if raw_paths is not None else None
+
         if progress is not None:
+            target_desc = f"target={[p.name for p in resolved_paths]}" if resolved_paths else f"n_recent={merged.get('n_most_recent_sessions_to_preprocess')}"
             progress(
-                f"Running process_XDFs_main (n_recent={merged.get('n_most_recent_sessions_to_preprocess')}, workers={merged.get('absolute_max_workers')})...",
+                f"Running process_XDFs_main ({target_desc}, cache={bool(merged.get('use_computation_cache', True))}, fif={bool(merged.get('should_write_final_merged_eeg_fif', True))}, workers={merged.get('absolute_max_workers')})...",
                 current=0,
                 total=0,
                 active_sessions=[],
@@ -272,7 +320,10 @@ class OfflineDataManagerService:
             n_most_recent_sessions_to_preprocess=merged.get("n_most_recent_sessions_to_preprocess"),
             should_write_final_merged_eeg_fif=bool(merged.get("should_write_final_merged_eeg_fif", True)),
             included_xdf_file_names=merged.get("included_xdf_file_names"),
+            included_xdf_paths=resolved_paths,
+            should_load_preprocessed=bool(merged.get("should_load_preprocessed", False)),
             use_computation_cache=bool(merged.get("use_computation_cache", True)),
+            use_mtime_in_cache_key=bool(merged.get("use_mtime_in_cache_key", False)),
             absolute_max_workers=int(merged.get("absolute_max_workers") or 2),
             session_catalog=self.session_catalog,
             use_session_catalog=True,
@@ -426,10 +477,19 @@ class OfflineDataManagerService:
         return records
 
 
-    def open_in_timeline(self, record_or_path: Union[Dict[str, Any], str, Path], **kwargs: Any) -> str:
-        """Open or focus an EEG ``.xdf`` session in ``pyPhoTimeline``."""
-        from phoofflineeeganalysis.analysis.timeline_handoff import open_session_in_timeline
+    def open_sessions_in_timeline(self, records_or_paths: Sequence[Union[Dict[str, Any], str, Path]], *, mode: str = "append", **kwargs: Any) -> str:
+        """Open, merge, or replace one or more EEG ``.xdf`` sessions in ``pyPhoTimeline``."""
+        from phoofflineeeganalysis.analysis.timeline_handoff import open_sessions_in_timeline
 
+        return open_sessions_in_timeline(records_or_paths, mode=mode, **kwargs)
+
+
+    def open_in_timeline(self, record_or_path: Union[Dict[str, Any], str, Path, Sequence[Union[Dict[str, Any], str, Path]]], *, mode: str = "append", **kwargs: Any) -> str:
+        """Open or focus one (or a list of) EEG ``.xdf`` session(s) in ``pyPhoTimeline``."""
+        from phoofflineeeganalysis.analysis.timeline_handoff import open_session_in_timeline, open_sessions_in_timeline
+
+        if isinstance(record_or_path, (list, tuple)):
+            return open_sessions_in_timeline(record_or_path, mode=mode, **kwargs)
         if isinstance(record_or_path, dict):
             xdf_path = record_or_path.get("xdf_path") or record_or_path.get("path")
             if not xdf_path:
@@ -439,9 +499,10 @@ class OfflineDataManagerService:
                 start=kwargs.pop("start", record_or_path.get("recording_datetime")),
                 duration_sec=kwargs.pop("duration_sec", record_or_path.get("duration_sec")),
                 status=kwargs.pop("status", record_or_path.get("status")),
+                mode=mode,
                 **kwargs,
             )
-        return open_session_in_timeline(record_or_path, **kwargs)
+        return open_session_in_timeline(record_or_path, mode=mode, **kwargs)
 
 
 __all__ = ["OfflineDataManagerService"]

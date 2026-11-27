@@ -17,4 +17,6 @@ process_defaults:
   n_most_recent_sessions_to_preprocess: 5
   should_write_final_merged_eeg_fif: true
   use_computation_cache: true
+  use_mtime_in_cache_key: false
+  should_load_preprocessed: false
   absolute_max_workers: 2

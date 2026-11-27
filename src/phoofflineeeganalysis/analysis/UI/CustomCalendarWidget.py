@@ -278,14 +278,22 @@ class SessionCalendarPanel(QWidget):
         self.day_label = QLabel("Select a day")
         self.day_label.setWordWrap(True)
         right_layout.addWidget(self.day_label)
+        from qtpy.QtWidgets import QAbstractItemView, QHBoxLayout as _QHBoxLayout
+
         self.session_list = QListWidget()
+        self.session_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.session_list.itemDoubleClicked.connect(self._on_session_activated)
         self.session_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.session_list.customContextMenuRequested.connect(self._on_session_list_context_menu)
         right_layout.addWidget(self.session_list)
+        btn_row = _QHBoxLayout()
         self.open_timeline_btn = QPushButton("Open in Timeline")
         self.open_timeline_btn.clicked.connect(self._on_open_timeline_clicked)
-        right_layout.addWidget(self.open_timeline_btn)
+        btn_row.addWidget(self.open_timeline_btn)
+        self.open_day_timeline_btn = QPushButton("Open All Day")
+        self.open_day_timeline_btn.clicked.connect(self._on_open_all_day_clicked)
+        btn_row.addWidget(self.open_day_timeline_btn)
+        right_layout.addLayout(btn_row)
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
@@ -410,35 +418,96 @@ class SessionCalendarPanel(QWidget):
     def _current_session_xdf_path(self, item: Optional[QListWidgetItem] = None) -> Optional[Path]:
         return self._current_item_path(item)
 
+    def _selected_session_dicts(self) -> List[dict]:
+        items = [self.session_list.item(i) for i in range(self.session_list.count()) if self.session_list.item(i) is not None and self.session_list.item(i).isSelected()]
+        if not items and self.session_list.currentItem() is not None:
+            items = [self.session_list.currentItem()]
+        out: List[dict] = []
+        for it in items:
+            payload = self._session_payload(it)
+            if isinstance(payload, dict) and payload.get("kind") == "session" and payload.get("xdf_path"):
+                out.append(payload)
+            elif isinstance(payload, (str, Path)):
+                out.append({"kind": "session", "xdf_path": str(payload)})
+        ## END for it in items...
+        return out
+
+
+    def _all_day_session_dicts(self) -> List[dict]:
+        out: List[dict] = []
+        for i in range(self.session_list.count()):
+            payload = self._session_payload(self.session_list.item(i))
+            if isinstance(payload, dict) and payload.get("kind") == "session" and payload.get("xdf_path"):
+                out.append(payload)
+        ## END for i in range(self.session_list.count())...
+        return out
+
+
+    def _open_session_dicts(self, session_dicts: List[dict], mode: str = "append") -> None:
+        if not session_dicts:
+            QMessageBox.information(self, "Open in Timeline", "Select one or more EEG sessions (or a day with EEG sessions) first.")
+            return
+        try:
+            from phoofflineeeganalysis.analysis.timeline_handoff import open_sessions_in_timeline
+
+            res = open_sessions_in_timeline(session_dicts, mode=mode)
+            desc = Path(str(session_dicts[0]["xdf_path"])).name if len(session_dicts) == 1 else f"{len(session_dicts)} sessions"
+            if res == "ipc":
+                self._emit_status(f"Merged/focused in running timeline: {desc}", 5000)
+            elif res == "ipc_error":
+                QMessageBox.warning(self, "Open in Timeline", f"Running timeline rejected session handoff for:\n{desc}")
+                self._emit_status(f"Timeline IPC error for: {desc}", 5000)
+            else:
+                self._emit_status(f"Started offline timeline for: {desc}", 5000)
+        except Exception as e:
+            QMessageBox.warning(self, "Open in Timeline", str(e))
+
+
     def _on_session_list_context_menu(self, pos: QPoint):
         item = self.session_list.itemAt(pos)
         if item is None:
             return
-        self.session_list.setCurrentItem(item)
+        if not item.isSelected():
+            self.session_list.clearSelection()
+            item.setSelected(True)
+            self.session_list.setCurrentItem(item)
         payload = self._session_payload(item)
         is_media = isinstance(payload, dict) and payload.get("kind") in ("video", "screenshot", "audio")
+        sel_sessions = self._selected_session_dicts()
+        day_sessions = self._all_day_session_dicts()
         menu = QMenu(self)
-        open_action = None if is_media else menu.addAction("Open in Timeline")
+        open_action = None if is_media else menu.addAction(f"Open {len(sel_sessions)} Selected in Timeline" if len(sel_sessions) > 1 else "Open in Timeline")
+        replace_action = None if is_media else menu.addAction(f"Replace Timeline with {len(sel_sessions)} Selected" if len(sel_sessions) > 1 else "Replace Timeline with Session")
+        open_all_action = menu.addAction(f"Open All Day Sessions ({len(day_sessions)})") if len(day_sessions) > 1 else None
         reveal_action = menu.addAction("Reveal in Explorer")
         copy_action = menu.addAction("Copy Path")
         chosen = menu.exec_(self.session_list.mapToGlobal(pos))
         if open_action is not None and chosen == open_action:
-            self._on_session_activated(item)
+            self._open_session_dicts(sel_sessions, mode="append")
+        elif replace_action is not None and chosen == replace_action:
+            self._open_session_dicts(sel_sessions, mode="replace")
+        elif open_all_action is not None and chosen == open_all_action:
+            self._open_session_dicts(day_sessions, mode="append")
         elif chosen == reveal_action:
             self._on_reveal_in_explorer(item)
         elif chosen == copy_action:
             self._on_copy_path(item)
 
+
     def _on_open_timeline_clicked(self):
-        item = self.session_list.currentItem()
-        if item is None:
-            QMessageBox.information(self, "Open in Timeline", "Select a session in the list first.")
+        sel = self._selected_session_dicts()
+        if sel:
+            self._open_session_dicts(sel, mode="append")
             return
-        payload = self._session_payload(item)
-        if isinstance(payload, dict) and payload.get("kind") in ("video", "screenshot", "audio"):
-            QMessageBox.information(self, "Open in Timeline", "Select an EEG session row to open in Timeline (media items support Reveal in Explorer / Copy Path).")
+        day_sessions = self._all_day_session_dicts()
+        if day_sessions and not self.session_list.selectedItems():
+            self._open_session_dicts(day_sessions, mode="append")
             return
-        self._on_session_activated(item)
+        QMessageBox.information(self, "Open in Timeline", "Select an EEG session row (or day with EEG sessions) to open in Timeline.")
+
+
+    def _on_open_all_day_clicked(self):
+        self._open_session_dicts(self._all_day_session_dicts(), mode="append")
 
     def _on_reveal_in_explorer(self, item: Optional[QListWidgetItem] = None):
         path = self._current_item_path(item)

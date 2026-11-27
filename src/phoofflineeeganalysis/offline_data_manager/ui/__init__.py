@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from phoofflineeeganalysis.offline_data_manager.ui.design_tokens import DesignTokens
 from phoofflineeeganalysis.offline_data_manager.ui.dialogs import (
+    ComputationOptionsDialog,
     ConsolidateMediaDialog,
     ProcessSessionsDialog,
     SourcesPathsDialog,
@@ -15,6 +16,7 @@ from phoofflineeeganalysis.offline_data_manager.ui.main_window import (
 )
 
 __all__ = [
+    "ComputationOptionsDialog",
     "ConsolidateMediaDialog",
     "DesignTokens",
     "PhoOfflineDataManagerWindow",

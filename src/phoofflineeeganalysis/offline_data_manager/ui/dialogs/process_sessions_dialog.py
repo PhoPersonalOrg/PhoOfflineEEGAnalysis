@@ -73,6 +73,14 @@ class ProcessSessionsDialog(QDialog):
         self.use_cache_check.setChecked(bool(defaults.get("use_computation_cache", True)))
         form.addRow("", self.use_cache_check)
 
+        self.use_mtime_check = QCheckBox("Include .xdf file mtime in cache key", self)
+        self.use_mtime_check.setChecked(bool(defaults.get("use_mtime_in_cache_key", False)))
+        form.addRow("", self.use_mtime_check)
+
+        self.load_preproc_check = QCheckBox("Load existing preprocessed artifacts", self)
+        self.load_preproc_check.setChecked(bool(defaults.get("should_load_preprocessed", False)))
+        form.addRow("", self.load_preproc_check)
+
         list_hdr = QHBoxLayout()
         lbl = QLabel("Optional Specific Sessions (leave unchecked to use Most Recent):", self)
         lbl.setObjectName("MutedLabel")
@@ -164,6 +172,8 @@ class ProcessSessionsDialog(QDialog):
             "included_xdf_file_names": checked_names if checked_names else None,
             "should_write_final_merged_eeg_fif": self.write_fif_check.isChecked(),
             "use_computation_cache": self.use_cache_check.isChecked(),
+            "use_mtime_in_cache_key": self.use_mtime_check.isChecked(),
+            "should_load_preprocessed": self.load_preproc_check.isChecked(),
             "absolute_max_workers": self.workers_spin.value(),
         }
 

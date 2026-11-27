@@ -29,6 +29,7 @@ from phoofflineeeganalysis.offline_data_manager.media_modalities import ALL_MODA
 from phoofflineeeganalysis.offline_data_manager.service import OfflineDataManagerService
 from phoofflineeeganalysis.offline_data_manager.ui.design_tokens import DesignTokens
 from phoofflineeeganalysis.offline_data_manager.ui.dialogs import (
+    ComputationOptionsDialog,
     ConsolidateMediaDialog,
     ProcessSessionsDialog,
     SourcesPathsDialog,
@@ -174,6 +175,17 @@ class PhoOfflineDataManagerWindow(QMainWindow):
         sessions_menu.addAction(self.action_cancel_job)
 
         sessions_menu.addSeparator()
+        self.action_open_selected_timeline = QAction("Open Selected / Day Sessions in Timeline", self)
+        self.action_open_selected_timeline.setShortcut("Ctrl+T")
+        self.action_open_selected_timeline.triggered.connect(lambda: self._open_current_selection_or_day_in_timeline(mode="append"))
+        sessions_menu.addAction(self.action_open_selected_timeline)
+
+        self.action_replace_selected_timeline = QAction("Replace Timeline with Selected / Day Sessions", self)
+        self.action_replace_selected_timeline.setShortcut("Ctrl+Shift+T")
+        self.action_replace_selected_timeline.triggered.connect(lambda: self._open_current_selection_or_day_in_timeline(mode="replace"))
+        sessions_menu.addAction(self.action_replace_selected_timeline)
+
+        sessions_menu.addSeparator()
         self.action_reload_catalogs = QAction("Reload Catalogs From Disk", self)
         self.action_reload_catalogs.triggered.connect(self.reload_catalogs)
         sessions_menu.addAction(self.action_reload_catalogs)
@@ -236,7 +248,9 @@ class PhoOfflineDataManagerWindow(QMainWindow):
         self.left_rail.sourcesPathsRequested.connect(self.on_edit_paths)
 
         self.calendar_panel.daySelected.connect(self._on_day_selected)
+        self.day_detail_panel.computeSessionRequested.connect(self._on_compute_session_requested)
         self.day_detail_panel.openInTimelineRequested.connect(self._on_open_in_timeline)
+        self.day_detail_panel.openSessionsInTimelineRequested.connect(self._on_open_sessions_in_timeline)
         self.day_detail_panel.statusMessage.connect(self.statusBar().showMessage)
         self.job_log_panel.cancelRequested.connect(self.on_cancel_job)
 
@@ -317,25 +331,42 @@ class PhoOfflineDataManagerWindow(QMainWindow):
         self.day_detail_panel.set_day_records(target, records)
 
 
-    def _on_open_in_timeline(self, record: Dict[str, Any]) -> None:
+    def _open_current_selection_or_day_in_timeline(self, mode: str = "append") -> None:
+        target = self.day_detail_panel.selected_eeg_records() or self.day_detail_panel.day_eeg_records()
+        if not target:
+            QMessageBox.information(self, "Open in Timeline", "No EEG .xdf sessions are available on the selected day.")
+            return
+        self._on_open_sessions_in_timeline(target, mode=mode)
+
+
+    def _on_open_sessions_in_timeline(self, records: List[Dict[str, Any]], mode: str = "append") -> None:
+        if not records:
+            return
         try:
-            mode = self.service.open_in_timeline(record)
-            fname = record.get("filename") or "session.xdf"
-            status = str(record.get("status") or "").lower()
-            cache_note = " (prefer cached spectrograms)" if status in ("computed", "exported") else ""
-            if mode == "ipc":
-                self.statusBar().showMessage(f"Zoomed/loaded in running timeline: {fname}{cache_note}", 5000)
-            elif mode == "ipc_error":
-                QMessageBox.warning(self, "Open in Timeline", f"Running timeline rejected show_session for:\n{fname}")
+            result = self.service.open_sessions_in_timeline(records, mode=mode)
+            n = len(records)
+            desc = (records[0].get("filename") or "session.xdf") if n == 1 else f"{n} EEG sessions"
+            any_cached = any(str(r.get("status") or "").lower() in ("computed", "exported") for r in records)
+            cache_note = " (prefer cached spectrograms)" if any_cached else ""
+            verb = "Replaced running timeline with" if str(mode).lower() == "replace" else "Merged/focused in running timeline:"
+            if result == "ipc":
+                self.statusBar().showMessage(f"{verb} {desc}{cache_note}", 5000)
+            elif result == "ipc_error":
+                QMessageBox.warning(self, "Open in Timeline", f"Running timeline rejected session handoff for:\n{desc}")
             else:
-                self.statusBar().showMessage(f"Started offline timeline for: {fname}{cache_note}", 5000)
+                self.statusBar().showMessage(f"Started offline timeline for: {desc}{cache_note}", 5000)
         except Exception as exc:
             QMessageBox.warning(self, "Open in Timeline", str(exc))
+
+
+    def _on_open_in_timeline(self, record: Dict[str, Any]) -> None:
+        self._on_open_sessions_in_timeline([record], mode="append")
 
 
     def _set_job_running(self, running: bool, label: str = "") -> None:
         self.toolbar.set_job_running(running)
         self.left_rail.set_job_running(running)
+        self.day_detail_panel.set_job_running(running)
         for act in self._menu_job_actions:
             act.setEnabled(not running)
         ## END for act in self._menu_job_actions...
@@ -503,6 +534,51 @@ class PhoOfflineDataManagerWindow(QMainWindow):
         self._run_job("Inspect XDF Stream Chips", _work, _done)
 
 
+    def _on_compute_session_requested(self, record: Dict[str, Any], open_options: bool) -> None:
+        if not isinstance(record, dict) or record.get("kind") != "session":
+            return
+        if open_options:
+            self.on_open_compute_options(target_record=record)
+        else:
+            self._start_compute_single_session(record)
+
+
+    def on_open_compute_options(self, target_record: Optional[Dict[str, Any]] = None) -> None:
+        dialog = ComputationOptionsDialog(options=self.service.get_compute_options(), target_record=target_record, parent=self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        updated = self.service.update_compute_options(dialog.get_options(), persist=True)
+        self.log(
+            f"Updated computation options: fif={updated.get('should_write_final_merged_eeg_fif')}, "
+            f"cache={updated.get('use_computation_cache')}, mtime={updated.get('use_mtime_in_cache_key')}, "
+            f"load_preprocessed={updated.get('should_load_preprocessed')}, workers={updated.get('absolute_max_workers')}"
+        )
+        self.statusBar().showMessage("Saved current computation options", 4000)
+        if dialog.run_requested and target_record is not None:
+            self._start_compute_single_session(target_record)
+
+
+    def _start_compute_single_session(self, record: Dict[str, Any]) -> None:
+        raw_path = record.get("xdf_path") or record.get("path")
+        if not raw_path:
+            QMessageBox.warning(self, "Compute Session", "Selected .xdf session has no file path.")
+            return
+        xdf_path = Path(str(raw_path))
+        if not xdf_path.is_file():
+            QMessageBox.warning(self, "Compute Session", f"XDF file not found on disk:\n{xdf_path}")
+            return
+        fname = record.get("filename") or xdf_path.name
+
+        def _work(progress: Callable[..., None]) -> Any:
+            return self.service.compute_session(record, progress=progress, cancel_event=self._cancel_event)
+
+        def _done(_result: Any) -> None:
+            self.log(f"Compute cancelled for {fname}." if self._last_job_cancelled else f"Finished computing {fname}.")
+            self.reload_catalogs()
+
+        self._run_job(f"Compute {fname}", _work, _done, poll_catalog=True, cancelable=True)
+
+
     def on_process_sessions(self) -> None:
         sess_df = self.service.session_catalog.load_sessions_dataframe()
         fnames = sess_df["xdf_filename"].dropna().astype(str).tolist() if len(sess_df) > 0 and "xdf_filename" in sess_df.columns else []
@@ -510,6 +586,7 @@ class PhoOfflineDataManagerWindow(QMainWindow):
         if dialog.exec_() != QDialog.Accepted:
             return
         params = dialog.get_params()
+        self.service.update_compute_options(params, persist=True)
 
         def _work(progress: Callable[..., None]) -> Any:
             return self.service.process_sessions(progress=progress, cancel_event=self._cancel_event, **params)
@@ -635,6 +712,8 @@ def create_preview_main_window() -> PhoOfflineDataManagerWindow:
     win = PhoOfflineDataManagerWindow(service=svc, auto_select_latest_day=False)
     win.calendar_panel.set_selected_day(SAMPLE_ANCHOR_DAY)
     win._on_day_selected(SAMPLE_ANCHOR_DAY)
+    if win.day_detail_panel.records_list.count() > 0:
+        win.day_detail_panel.records_list.setCurrentRow(0)
     win.log("Preview ready — Pho Offline Data Manager initialized with sample multimodal catalog.")
     return win
 

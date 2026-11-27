@@ -18,6 +18,8 @@ DEFAULT_PROCESS_DEFAULTS: Dict[str, Any] = {
     "n_most_recent_sessions_to_preprocess": 5,
     "should_write_final_merged_eeg_fif": True,
     "use_computation_cache": True,
+    "use_mtime_in_cache_key": False,
+    "should_load_preprocessed": False,
     "absolute_max_workers": 2,
 }
 

@@ -30,6 +30,11 @@ class DesignTokens:
         ACCENT_PRIMARY_HOVER = "#6092EE"
         ACCENT_PRIMARY_DISABLED = "#2B3A52"
 
+        ACCENT_COMPUTE = "#238636"
+        ACCENT_COMPUTE_HOVER = "#2EA043"
+        ACCENT_COMPUTE_BORDER = "#3FB950"
+        ACCENT_COMPUTE_DISABLED = "#22342A"
+
         STATUS_ONLINE = "#2EA043"
         STATUS_WARNING = "#D29922"
         STATUS_DANGER = "#E5534B"
@@ -261,6 +266,21 @@ class DesignTokens:
         }}
         QPushButton#PrimaryButton:disabled {{
             background-color: {c.ACCENT_PRIMARY_DISABLED};
+            color: {c.TEXT_MUTED};
+            border-color: {c.BORDER_SUBTLE};
+        }}
+        QPushButton#ComputeButton {{
+            background-color: {c.ACCENT_COMPUTE};
+            color: {c.TEXT_PRIMARY};
+            border: 1px solid {c.ACCENT_COMPUTE_BORDER};
+            font-weight: 600;
+            padding: 6px 12px;
+        }}
+        QPushButton#ComputeButton:hover {{
+            background-color: {c.ACCENT_COMPUTE_HOVER};
+        }}
+        QPushButton#ComputeButton:disabled {{
+            background-color: {c.ACCENT_COMPUTE_DISABLED};
             color: {c.TEXT_MUTED};
             border-color: {c.BORDER_SUBTLE};
         }}

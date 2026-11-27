@@ -1,59 +1,50 @@
-# Multi-root media discovery sources for Pho Offline Data Manager (derived from VIDEO_FILES.md).
-# Implicit exclude: any path segment named "_DUP".
-# Categories map to consolidate subfolders under consolidate.dest_root.
-
 categories:
   EyeRecordings:
-    - path: "H:/ScreenRecordings/EyeTrackerVR_Recordings"
-      recursive: false
-
+  - path: H:/ScreenRecordings/EyeTrackerVR_Recordings
+    recursive: false
   WebcamRecordings:
-    - path: "H:/ScreenRecordings/REC_continuous_video_recorder"
-      recursive: false
-    - path: "D:/Captures/PhoBehaviorProject/WebcamRecordings"
-      recursive: false
-    - path: "E:/Dropbox (Personal)/Screenshots/ScreenVideoCaptures/WebcamRecordings"
-      recursive: false
-    - path: "E:/Dropbox (Personal)/personalStore/records/WebcamRecordings"
-      recursive: false
-
+  - path: H:/ScreenRecordings/REC_continuous_video_recorder
+    recursive: false
+  - path: D:/Captures/PhoBehaviorProject/WebcamRecordings
+    recursive: false
+  - path: E:/Dropbox (Personal)/Screenshots/ScreenVideoCaptures/WebcamRecordings
+    recursive: false
+  - path: E:/Dropbox (Personal)/personalStore/records/WebcamRecordings
+    recursive: false
   ScreenRecordings:
-    - path: "H:/ScreenRecordings"
-      recursive: false
-      exclude:
-        - "H:/ScreenRecordings/EyeTrackerVR_Recordings"
-        - "H:/ScreenRecordings/REC_continuous_video_recorder"
-    - path: "F:/ScreenRecordings"
-      recursive: false
-    - path: "E:/Dropbox (Personal)/Screenshots/ScreenVideoCaptures"
-      recursive: false
-      exclude:
-        - "E:/Dropbox (Personal)/Screenshots/ScreenVideoCaptures/WebcamRecordings"
-    - path: "E:/Dropbox (Personal)/Screenshots"
-      recursive: false
-      exclude:
-        - "E:/Dropbox (Personal)/Screenshots/ScreenVideoCaptures"
-        - "E:/Dropbox (Personal)/Screenshots/ShareX Screenshots"
-
+  - path: H:/ScreenRecordings
+    recursive: false
+    exclude:
+    - H:/ScreenRecordings/EyeTrackerVR_Recordings
+    - H:/ScreenRecordings/REC_continuous_video_recorder
+  - path: F:/ScreenRecordings
+    recursive: false
+  - path: E:/Dropbox (Personal)/Screenshots/ScreenVideoCaptures
+    recursive: false
+    exclude:
+    - E:/Dropbox (Personal)/Screenshots/ScreenVideoCaptures/WebcamRecordings
+  - path: E:/Dropbox (Personal)/Screenshots
+    recursive: false
+    exclude:
+    - E:/Dropbox (Personal)/Screenshots/ScreenVideoCaptures
+    - E:/Dropbox (Personal)/Screenshots/ShareX Screenshots
   Screenshots:
-    - path: "E:/Dropbox (Personal)/Screenshots/ShareX Screenshots"
-      recursive: false
-    - path: "H:/Personal/Screenshots/ShareX Screenshots"
-      recursive: false
-
+  - path: E:/Dropbox (Personal)/Screenshots/ShareX Screenshots
+    recursive: false
+  - path: H:/Personal/Screenshots/ShareX Screenshots
+    recursive: false
   AudioRecordings:
-    - path: "D:/Captures/Just Press Record"
-      recursive: true
-    - path: "E:/Dropbox (Personal)/personalStore/records/Audio Recordings"
-      recursive: false
-    - path: "H:/backups/2026-09-21_iPhone15Pro/WhisperApp/Audio/ACTIVE"
-      recursive: false
-      exclude:
-        - "H:/backups/2026-09-21_iPhone15Pro/WhisperApp/Audio/ACTIVE/_DUP"
-    - path: "H:/backups/2026-09-21_iPhone15Pro/Just Press Record"
-      recursive: true
-    - path: "H:/backups/2026-09-21_iPhone15Pro/VoiceMemos"
-      recursive: true
-
+  - path: D:/Captures/Just Press Record
+    recursive: true
+  - path: E:/Dropbox (Personal)/personalStore/records/Audio Recordings
+    recursive: false
+  - path: H:/backups/2026-09-21_iPhone15Pro/WhisperApp/Audio/ACTIVE
+    recursive: false
+    exclude:
+    - H:/backups/2026-09-21_iPhone15Pro/WhisperApp/Audio/ACTIVE/_DUP
+  - path: H:/backups/2026-09-21_iPhone15Pro/Just Press Record
+    recursive: true
+  - path: H:/backups/2026-09-21_iPhone15Pro/VoiceMemos
+    recursive: true
 consolidate:
-  dest_root: "H:/PhoBehaviorProject/RECORDINGS"
+  dest_root: H:/PhoBehaviorProject/RECORDINGS

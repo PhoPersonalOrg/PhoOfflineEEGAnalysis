@@ -1461,7 +1461,7 @@ class SpectogramPlottingHelper:
 
 
 	@classmethod
-	def process_XDFs_main(cls, n_most_recent_sessions_to_preprocess: Optional[int] = 5, should_write_final_merged_eeg_fif: bool = True, included_xdf_file_names: Optional[List]=None, should_load_preprocessed: bool = False, use_computation_cache: bool = True, cache_root: Optional[Path] = None, use_mtime_in_cache_key: bool = False, use_graph_computation_cache: bool = False, absolute_max_workers: int = 2, session_catalog: Optional[SessionCatalog] = None, use_session_catalog: bool = True, retain_in_memory: bool = True, session_sink: Optional[Callable[[int, Any, Any, Any, Any], None]] = None, progress_callback: Optional[Callable[..., None]] = None, cancel_event: Optional[threading.Event] = None):
+	def process_XDFs_main(cls, n_most_recent_sessions_to_preprocess: Optional[int] = 5, should_write_final_merged_eeg_fif: bool = True, included_xdf_file_names: Optional[List]=None, included_xdf_paths: Optional[List[Path]] = None, should_load_preprocessed: bool = False, use_computation_cache: bool = True, cache_root: Optional[Path] = None, use_mtime_in_cache_key: bool = False, use_graph_computation_cache: bool = False, absolute_max_workers: int = 2, session_catalog: Optional[SessionCatalog] = None, use_session_catalog: bool = True, retain_in_memory: bool = True, session_sink: Optional[Callable[[int, Any, Any, Any, Any], None]] = None, progress_callback: Optional[Callable[..., None]] = None, cancel_event: Optional[threading.Event] = None):
 		""" Processes a single .xdf file independently to produce all exports
 
 			from PhoOfflineEEGAnalysis.main_analyze_run import SpectogramPlottingHelper
@@ -1501,13 +1501,16 @@ class SpectogramPlottingHelper:
 
 
 		# Parallel XDF file processing
-		assert lab_recorder_output_path.exists()
-
-		lab_recorder_xdf_files: list[Path] = list(lab_recorder_output_path.glob('*.xdf'))
-		n_total_found_files: int = len(lab_recorder_xdf_files)
+		if included_xdf_paths is not None:
+			lab_recorder_xdf_files: list[Path] = [Path(p) for p in included_xdf_paths if Path(p).is_file()]
+			n_total_found_files: int = len(lab_recorder_xdf_files)
+		else:
+			assert lab_recorder_output_path.exists()
+			lab_recorder_xdf_files = list(lab_recorder_output_path.glob('*.xdf'))
+			n_total_found_files = len(lab_recorder_xdf_files)
 
 		# Filter by included file names if specified
-		if included_xdf_file_names is not None:
+		if included_xdf_file_names is not None and included_xdf_paths is None:
 			print(f'limiting to included_xdf_file_names: {included_xdf_file_names}...')
 			lab_recorder_xdf_files = [v for v in lab_recorder_xdf_files if v.name in included_xdf_file_names]
 			n_filtered_found_files: int = len(lab_recorder_xdf_files)
@@ -1528,13 +1531,18 @@ class SpectogramPlottingHelper:
 		if use_session_catalog and catalog is None:
 			catalog = get_or_create_catalog(pickled_data_path=pickled_data_path)
 		if catalog is not None:
-			n_discovered = catalog.discover_and_upsert(lab_recorder_output_path, recordings_extensions=['.xdf'])
-			print(f"Session catalog: {catalog.db_path.as_posix()} (discovered/upserted {n_discovered} XDF files under {lab_recorder_output_path.as_posix()})")
+			if included_xdf_paths is not None:
+				parent_dirs = sorted({p.parent for p in lab_recorder_xdf_files if p.parent.exists()}, key=lambda d: d.as_posix())
+				n_discovered = catalog.discover_and_upsert(parent_dirs, recordings_extensions=['.xdf']) if parent_dirs else 0
+				print(f"Session catalog: {catalog.db_path.as_posix()} (discovered/upserted {n_discovered} XDF files from explicit target parent(s))")
+			elif lab_recorder_output_path.exists():
+				n_discovered = catalog.discover_and_upsert(lab_recorder_output_path, recordings_extensions=['.xdf'])
+				print(f"Session catalog: {catalog.db_path.as_posix()} (discovered/upserted {n_discovered} XDF files under {lab_recorder_output_path.as_posix()})")
 
 		# Determine optimal number of workers
 		cpu_count: int = (os.cpu_count() or 2)
 		absolute_max_workers = min(absolute_max_workers, cpu_count)
-		max_workers = min(len(lab_recorder_xdf_files), absolute_max_workers)
+		max_workers = max(1, min(len(lab_recorder_xdf_files), absolute_max_workers))
 		n_files_to_process: int = len(lab_recorder_xdf_files)
 		print(f"Processing {n_files_to_process} XDF files using {max_workers} parallel workers...")
 
