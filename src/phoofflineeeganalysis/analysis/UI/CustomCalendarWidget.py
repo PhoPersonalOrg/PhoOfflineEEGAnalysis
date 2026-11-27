@@ -55,6 +55,8 @@ VIDEO_CATEGORY_COLORS = {
     "EyeRecordings": QColor(156, 39, 176, 175),  # purple
     "WebcamRecordings": QColor(0, 150, 136, 175),  # teal
     "ScreenRecordings": QColor(255, 111, 0, 175),  # orange
+    "Screenshots": QColor(96, 125, 139, 175),  # slate
+    "AudioRecordings": QColor(158, 157, 36, 175),  # olive
     "default": QColor(120, 144, 156, 165),  # slate
 }
 
@@ -355,6 +357,7 @@ class SessionCalendarPanel(QWidget):
             for v_row in videos.itertuples():
                 fname = getattr(v_row, "filename", None) or Path(str(getattr(v_row, "video_path", "video"))).name
                 category = getattr(v_row, "category", "Video")
+                mkind = str(getattr(v_row, "media_kind", "") or "").lower()
                 rec_dt = getattr(v_row, "recording_datetime", None)
                 time_str = rec_dt.strftime("%H:%M:%S") if isinstance(rec_dt, datetime) else "?"
                 dur = getattr(v_row, "duration_sec", None)
@@ -362,14 +365,20 @@ class SessionCalendarPanel(QWidget):
                     dur_str = f"{float(dur) / 60.0:.1f} min"
                     dur_val = float(dur)
                 else:
-                    dur_str = "duration unknown"
+                    dur_str = "still image" if (mkind == "screenshot" or category == "Screenshots") else "duration unknown"
                     dur_val = None
-                text = f"{time_str}  [Video:{category}]  {fname}  ({dur_str})"
+                if mkind == "screenshot" or category == "Screenshots":
+                    badge = "[Screenshot]"
+                elif mkind == "audio" or category == "AudioRecordings":
+                    badge = "[Audio]"
+                else:
+                    badge = f"[Video:{category}]"
+                text = f"{time_str}  {badge}  {fname}  ({dur_str})"
                 item = QListWidgetItem(text)
                 item.setData(
                     Qt.UserRole,
                     {
-                        "kind": "video",
+                        "kind": mkind if mkind in ("screenshot", "audio") else "video",
                         "video_path": getattr(v_row, "video_path", None),
                         "category": category,
                         "recording_datetime": rec_dt,
@@ -391,7 +400,7 @@ class SessionCalendarPanel(QWidget):
         if payload is None:
             return None
         if isinstance(payload, dict):
-            raw_path = payload.get("video_path") if payload.get("kind") == "video" else payload.get("xdf_path")
+            raw_path = payload.get("xdf_path") if payload.get("kind") == "session" else (payload.get("video_path") or payload.get("path"))
         else:
             raw_path = payload  # Legacy: bare path string
         if not raw_path:
@@ -407,9 +416,9 @@ class SessionCalendarPanel(QWidget):
             return
         self.session_list.setCurrentItem(item)
         payload = self._session_payload(item)
-        is_video = isinstance(payload, dict) and payload.get("kind") == "video"
+        is_media = isinstance(payload, dict) and payload.get("kind") in ("video", "screenshot", "audio")
         menu = QMenu(self)
-        open_action = None if is_video else menu.addAction("Open in Timeline")
+        open_action = None if is_media else menu.addAction("Open in Timeline")
         reveal_action = menu.addAction("Reveal in Explorer")
         copy_action = menu.addAction("Copy Path")
         chosen = menu.exec_(self.session_list.mapToGlobal(pos))
@@ -426,8 +435,8 @@ class SessionCalendarPanel(QWidget):
             QMessageBox.information(self, "Open in Timeline", "Select a session in the list first.")
             return
         payload = self._session_payload(item)
-        if isinstance(payload, dict) and payload.get("kind") == "video":
-            QMessageBox.information(self, "Open in Timeline", "Select an EEG session row to open in Timeline (videos support Reveal in Explorer / Copy Path).")
+        if isinstance(payload, dict) and payload.get("kind") in ("video", "screenshot", "audio"):
+            QMessageBox.information(self, "Open in Timeline", "Select an EEG session row to open in Timeline (media items support Reveal in Explorer / Copy Path).")
             return
         self._on_session_activated(item)
 
@@ -455,7 +464,7 @@ class SessionCalendarPanel(QWidget):
 
     def _on_session_activated(self, item: QListWidgetItem):
         payload = self._session_payload(item)
-        if isinstance(payload, dict) and payload.get("kind") == "video":
+        if isinstance(payload, dict) and payload.get("kind") in ("video", "screenshot", "audio"):
             self._on_reveal_in_explorer(item)
             return
         if not isinstance(payload, dict):

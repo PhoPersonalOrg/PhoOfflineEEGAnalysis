@@ -1,0 +1,20 @@
+# Centralized paths and defaults for Pho Offline Data Manager.
+# Machine-specific overrides save to gitignored config/offline_data_manager/paths.local.yaml
+# or can be supplied via environment variables:
+#   PHO_LAB_RECORDER_DIRS (os.pathsep-separated)
+#   PHO_PICKLED_DATA_PATH
+#   PHO_SESSION_CATALOG_PATH
+#   PHO_MEDIA_CATALOG_PATH / PHO_VIDEO_CATALOG_PATH
+#   PHO_MEDIA_SOURCES_YAML / PHO_VIDEO_SOURCES_YAML
+
+lab_recorder_dirs: []
+pickled_data_path: ""
+session_catalog_path: ""
+media_catalog_path: "output/video_catalog.sqlite"
+media_sources_yaml: "config/offline_data_manager/media_sources.yaml"
+
+process_defaults:
+  n_most_recent_sessions_to_preprocess: 5
+  should_write_final_merged_eeg_fif: true
+  use_computation_cache: true
+  absolute_max_workers: 2

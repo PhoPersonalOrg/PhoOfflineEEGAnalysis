@@ -34,4 +34,5 @@ examples_jupyter/EXTERNAL
 **/exploded-call-hierarchy.ipynb
 .cursor/chats
 config/*.local.yaml
+config/**/*.local.yaml
 

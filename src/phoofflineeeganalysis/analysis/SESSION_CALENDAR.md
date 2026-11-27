@@ -1,6 +1,6 @@
-# Offline Analysis Manager & Session Calendar
+# Offline Data Manager & Session Calendar
 
-The primary PyQt GUI for offline EEG and video data management is **`OfflineAnalysisManagerWindow`**, which embeds the month-grid **`SessionCalendarPanel`** alongside session discovery, EEG processing, video catalog actions, and centralized path configuration.
+The primary PyQt5 GUI for offline EEG and multimodal recording management is **`PhoOfflineDataManagerWindow`** (`phoofflineeeganalysis.offline_data_manager.ui.main_window`), backed by **`OfflineDataManagerService`** (`phoofflineeeganalysis.offline_data_manager.service`). Legacy **`OfflineAnalysisManagerWindow`** remains importable (and accessible via `--legacy-ui`).
 
 ## Launching the Manager
 
@@ -10,20 +10,21 @@ python run_offline_analysis_manager.py
 phoofflineeeganalysis
 # optional flags:
 phoofflineeeganalysis --discover
-phoofflineeeganalysis --config path/to/offline_analysis_paths.yaml
+phoofflineeeganalysis --config path/to/paths.yaml
+phoofflineeeganalysis --legacy-ui
 ```
 
 `run_session_calendar.py` remains as a deprecation alias that launches the manager.
 
-## Path Configuration (`AppPaths`)
+## Path & Multimodal Source Configuration (`AppPaths`)
 
-Committed defaults live in `config/offline_analysis_paths.yaml` (no hard-coded drive letters). Machine-specific overrides are stored in gitignored `config/offline_analysis_paths.local.yaml` (or edited in-app via **Config → Edit Paths...**), and can also be overridden via environment variables:
+Committed defaults live in `config/offline_data_manager/paths.yaml` and `config/offline_data_manager/media_sources.yaml` (with automatic fallback to legacy `config/offline_analysis_paths.yaml` and `config/video_sources.yaml`). Machine-specific overrides are stored in gitignored `config/offline_data_manager/paths.local.yaml` (or edited in-app via **Sources & Paths...**), and can also be overridden via environment variables:
 
 - `PHO_LAB_RECORDER_DIRS` (`os.pathsep`-separated list)
 - `PHO_PICKLED_DATA_PATH`
 - `PHO_SESSION_CATALOG_PATH`
-- `PHO_VIDEO_CATALOG_PATH`
-- `PHO_VIDEO_SOURCES_YAML`
+- `PHO_MEDIA_CATALOG_PATH` / `PHO_VIDEO_CATALOG_PATH`
+- `PHO_MEDIA_SOURCES_YAML` / `PHO_VIDEO_SOURCES_YAML`
 
 ## Manager Features
 
@@ -72,9 +73,11 @@ Legacy import (notebooks): `from phoofflineeeganalysis.UI.CustomCalendarWidget i
 
 ## API Sketch
 
+- `OfflineDataManagerService` (`stats`, `list_sources`, `discover_sessions`, `ingest_media`, `day_records`, `calendar_payload`)
 - `AppPaths.load(...)` / `AppPaths.save(...)`
-- `SessionCatalog.discover_and_upsert(dirs)` / `load_calendar_dataframe()`
-- `VideoCatalog.discover_and_upsert(...)` / `load_calendar_dataframe()` / `consolidate(...)`
+- `SessionCatalog.discover_and_upsert(dirs, enrich_streams=...)` / `load_calendar_dataframe()`
+- `MediaCatalog` (`VideoCatalog` alias) `discover_and_upsert(...)` / `load_calendar_dataframe(categories=..., media_kinds=...)` / `consolidate(...)`
+- `PhoOfflineDataManagerWindow` / `launch_offline_data_manager(...)`
 - `SessionCalendarPanel` (embeddable widget) / `SessionCalendarWindow` / `launch_session_calendar(...)`
 - `OfflineAnalysisManagerWindow` / `launch_offline_analysis_manager(...)`
 - `open_session_in_timeline(xdf_path, start=..., duration_sec=...)` (IPC or spawn)
