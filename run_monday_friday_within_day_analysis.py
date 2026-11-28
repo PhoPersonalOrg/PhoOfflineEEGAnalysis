@@ -1,10 +1,21 @@
-"""Process missing preceding-two-month sessions (prefer NPZ reuse) + within-day early-vs-late analysis."""
+"""Process missing sessions (NPZ reuse + XDF chunks) and run Mon→Fri + within-day early-vs-late analysis.
+
+Prereq (optional):
+    uv run --frozen python run_list_preceding_sessions.py
+        writes session_summaries/_missing_preceding_two_months.csv
+
+Usage:
+    uv run --frozen python run_monday_friday_within_day_analysis.py
+    uv run --frozen python run_monday_friday_within_day_analysis.py --skip-process --days 92
+"""
 
 from __future__ import annotations
 
+import argparse
+import gc
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-import re
 from zoneinfo import ZoneInfo
 
 import matplotlib
@@ -26,7 +37,6 @@ FOCUS_METRICS = [
 ]
 EARLY_END_S = 30 * 60.0
 MIN_SESSION_S_FOR_SPLIT = 45 * 60.0
-TZ = ZoneInfo(DEFAULT_TIMEZONE)
 NPZ_TS_RE = re.compile(r"spectrograms_(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})\.npz$")
 
 
@@ -78,38 +88,6 @@ def _metrics_from_Sxx_slice(Sxx: np.ndarray, freqs: np.ndarray) -> dict[str, flo
 	}
 
 
-def _time_series_metrics(Sxx: np.ndarray, freqs: np.ndarray, times: np.ndarray) -> pd.DataFrame:
-	"""Per-timepoint channel-mean band metrics. Sxx: (n_ch, n_freq, n_time)."""
-	masks = _band_masks(freqs)
-	ch_mean = np.nanmean(Sxx, axis=0)  # (n_freq, n_time)
-	total = np.nanmean(ch_mean[masks["total"], :], axis=0)
-	delta = np.nanmean(ch_mean[masks["delta"], :], axis=0)
-	theta = np.nanmean(ch_mean[masks["theta"], :], axis=0)
-	alpha = np.nanmean(ch_mean[masks["alpha"], :], axis=0)
-	beta = np.nanmean(ch_mean[masks["beta"], :], axis=0)
-	with np.errstate(divide="ignore", invalid="ignore"):
-		df = pd.DataFrame({
-			"t_sec": times.astype(float),
-			"total_power_1.0_to_40.0_hz": total,
-			"delta_rel": delta / total,
-			"theta_rel": theta / total,
-			"alpha_rel": alpha / total,
-			"beta_rel": beta / total,
-			"alpha_theta_ratio": alpha / theta,
-			"beta_alpha_ratio": beta / alpha,
-		})
-	return df
-
-
-def _find_npz_for_meas(outputs_root: Path, meas_utc: datetime) -> Path | None:
-	"""Newest npz matching spectrograms_YYYY-MM-DDTHH-MM-SS for this meas time."""
-	stamp = meas_utc.astimezone(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
-	# npz uses hyphens in time
-	stamp_npz = stamp.replace(":", "-")
-	cands = sorted(outputs_root.glob(f"*spectrograms_{stamp_npz}.npz"), key=lambda p: p.stat().st_mtime, reverse=True)
-	return cands[0] if cands else None
-
-
 def _index_all_npz(outputs_root: Path) -> pd.DataFrame:
 	rows = []
 	for p in outputs_root.glob("*spectrograms_*.npz"):
@@ -117,7 +95,7 @@ def _index_all_npz(outputs_root: Path) -> pd.DataFrame:
 		if not m:
 			continue
 		meas_utc = datetime.fromisoformat(f"{m.group(1)}T{m.group(2)}:{m.group(3)}:{m.group(4)}").replace(tzinfo=timezone.utc)
-		meas_local = meas_utc.astimezone(TZ)
+		meas_local = meas_utc.astimezone(ZoneInfo(DEFAULT_TIMEZONE))
 		rows.append({
 			"npz_path": str(p),
 			"npz_mtime": p.stat().st_mtime,
@@ -133,8 +111,7 @@ def _index_all_npz(outputs_root: Path) -> pd.DataFrame:
 	df = pd.DataFrame(rows)
 	if df.empty:
 		return df
-	df = df.sort_values(["stamp", "npz_mtime"]).drop_duplicates("stamp", keep="last").reset_index(drop=True)
-	return df
+	return df.sort_values(["stamp", "npz_mtime"]).drop_duplicates("stamp", keep="last").reset_index(drop=True)
 
 
 def _summary_row_from_npz(npz_path: Path, xdf_filename: str | None = None) -> dict | None:
@@ -148,14 +125,13 @@ def _summary_row_from_npz(npz_path: Path, xdf_filename: str | None = None) -> di
 	meas_dt = datetime.fromtimestamp(meas_sec, tz=timezone.utc) if np.isfinite(meas_sec) else None
 	metrics = _metrics_from_Sxx_slice(Sxx, freqs)
 	duration_s = float(times[-1] - times[0]) if times.size else float("nan")
-	n_channels = int(Sxx.shape[0])
 	return {
 		"session_idx": 0,
 		"xdf_filename": xdf_filename,
 		"meas_date": meas_dt.strftime("%Y-%m-%d %H:%M:%S") if meas_dt else "",
 		"duration_s": duration_s,
 		"sfreq_hz": float("nan"),
-		"n_channels": n_channels,
+		"n_channels": int(Sxx.shape[0]),
 		**metrics,
 		"manifold_n_windows": float("nan"),
 		"manifold_pc1_std": float("nan"),
@@ -166,28 +142,25 @@ def _summary_row_from_npz(npz_path: Path, xdf_filename: str | None = None) -> di
 		"manifold_pc3_range": float("nan"),
 		"manifold_traj_path_length": float("nan"),
 		"manifold_traj_speed_rms": float("nan"),
-		"_source_npz": str(npz_path),
 	}
 
 
-def process_missing_xdfs(missing_df: pd.DataFrame) -> Path | None:
-	"""Process size>=2MB missing XDFs with streaming sink; return incremental summary CSV path."""
-	to_process = missing_df.loc[missing_df["size_mb"] >= 2.0].copy()
-	tiny = missing_df.loc[missing_df["size_mb"] < 2.0]
-	print(f"Missing total={len(missing_df)}; process size>=2MB: {len(to_process)}; skip tiny: {len(tiny)}")
+def process_missing_xdfs(missing_df: pd.DataFrame, *, min_size_mb: float = 2.0, chunk_size: int = 3) -> list[Path]:
+	"""Process size>=min_size_mb missing XDFs (NPZ reuse first, then XDF chunks). Returns written summary CSV paths."""
+	to_process = missing_df.loc[missing_df["size_mb"] >= min_size_mb].copy()
+	tiny = missing_df.loc[missing_df["size_mb"] < min_size_mb]
+	print(f"Missing total={len(missing_df)}; process size>={min_size_mb}MB: {len(to_process)}; skip tiny: {len(tiny)}")
 	for _, r in tiny.iterrows():
 		print(f"  SKIP tiny {r['local_date']} {r['size_mb']} MB {r['name']}")
 	## END for _, r in tiny.iterrows()...
 
 	if to_process.empty:
-		return None
+		return []
 
-	# Prefer deriving from existing NPZ first
 	npz_index = _index_all_npz(outputs_root_folder)
 	derived_rows = []
 	still_need = []
 	for _, r in to_process.iterrows():
-		# match by filename UTC stamp -> npz stamp
 		m = re.search(r"(\d{4}-\d{2}-\d{2})T(\d{2})(\d{2})(\d{2})", r["name"])
 		if m and not npz_index.empty:
 			stamp = f"{m.group(1)}T{m.group(2)}-{m.group(3)}-{m.group(4)}"
@@ -203,13 +176,11 @@ def process_missing_xdfs(missing_df: pd.DataFrame) -> Path | None:
 
 	summaries_dir = outputs_root_folder / "session_summaries"
 	summaries_dir.mkdir(parents=True, exist_ok=True)
-	parts = []
+	parts: list[Path] = []
 	if derived_rows:
 		derived_df = pd.DataFrame(derived_rows)
 		derived_path = summaries_dir / f"{datetime.now().strftime('%Y-%m-%d_')}preceding_from_npz_session_summaries.csv"
-		# drop helper
-		out_cols = [c for c in derived_df.columns if not c.startswith("_")]
-		derived_df[out_cols].to_csv(derived_path, index=False)
+		derived_df.to_csv(derived_path, index=False)
 		print(f"Wrote NPZ-derived summaries: {derived_path} n={len(derived_df)}")
 		parts.append(derived_path)
 
@@ -218,34 +189,6 @@ def process_missing_xdfs(missing_df: pd.DataFrame) -> Path | None:
 		usable = [r["name"] for r in still_need]
 		paths = [Path(r["path"]) for r in still_need]
 		catalog = get_or_create_catalog(pickled_data_path=pickled_data_path)
-		summary_rows: list[dict] = []
-		sink_lock = __import__("threading").Lock()
-
-		def _sink(idx, eeg_raw, motion_raw, stream_infos, result):
-			xdf_filename = None
-			try:
-				if stream_infos is not None and "xdf_filename" in getattr(stream_infos, "columns", []):
-					xdf_filename = str(stream_infos["xdf_filename"].iloc[0])
-			except Exception:
-				pass
-			row = SpectogramPlottingHelper._compute_one_session_summary_row(idx, eeg_raw, result, xdf_filename=xdf_filename) if hasattr(SpectogramPlottingHelper, "_compute_one_session_summary_row") else None
-			# fallback: use public batch helper on single session
-			if row is None:
-				tmp = SpectogramPlottingHelper.compute_session_summary_metrics([eeg_raw], [result], stream_infos, summaries_dir / "_tmp_one", filename_prefix=f"one_{idx}_")
-				# actually writes file; read it
-				one_df = pd.read_csv(tmp)
-				if len(one_df):
-					rec = one_df.iloc[0].to_dict()
-					if xdf_filename:
-						rec["xdf_filename"] = xdf_filename
-					with sink_lock:
-						summary_rows.append(rec)
-				return
-			with sink_lock:
-				summary_rows.append(row)
-
-		# Simpler: retain_in_memory True but in chunks of 3 to limit RAM
-		chunk_size = 3
 		for start in range(0, len(usable), chunk_size):
 			chunk_names = usable[start:start + chunk_size]
 			chunk_paths = paths[start:start + chunk_size]
@@ -264,14 +207,13 @@ def process_missing_xdfs(missing_df: pd.DataFrame) -> Path | None:
 			)
 			prefix = datetime.now().strftime("%Y-%m-%d_") + f"preceding_chunk{start // chunk_size}_"
 			csv_path = SpectogramPlottingHelper.compute_session_summary_metrics(eeg_raws, results, stream_infos_df, summaries_dir, filename_prefix=prefix)
-			parts.append(csv_path)
+			parts.append(Path(csv_path))
 			print(f"  chunk summary: {csv_path}")
 			del eeg_raws, results, stream_infos_df
-			import gc
 			gc.collect()
 		## END for start in range(0, len(usable), chunk_size)...
 
-	return parts[0] if parts else None
+	return parts
 
 
 def run_weekday_trend(sessions_csv: Path, start_local, end_local, out_dir: Path) -> None:
@@ -289,6 +231,8 @@ def run_weekday_trend(sessions_csv: Path, start_local, end_local, out_dir: Path)
 	agg_kwargs = {"n_days": ("local_date", "count"), "total_duration_s": ("total_duration_s", "sum")}
 	for m in metric_cols:
 		agg_kwargs[m] = (m, "mean")
+	## END for m in metric_cols...
+
 	weekday_means = weekday.groupby("weekday", as_index=False).agg(**agg_kwargs)
 	weekday_means["weekday_name"] = weekday_means["weekday"].map({0: "Monday", 1: "Tuesday", 2: "Wednesday", 3: "Thursday", 4: "Friday"})
 	weekday_means.to_csv(out_dir / "weekday_means.csv", index=False)
@@ -313,7 +257,7 @@ def run_weekday_trend(sessions_csv: Path, start_local, end_local, out_dir: Path)
 
 	trend_df = pd.DataFrame(trend_rows).sort_values("p_value", kind="stable")
 	trend_df.to_csv(out_dir / "weekday_linear_trends.csv", index=False)
-	print("\n3mo weekday linear trends (focus):")
+	print("\nWeekday linear trends (focus):")
 	print(trend_df.loc[trend_df["metric"].isin(FOCUS_METRICS), ["metric", "n_days", "slope_per_weekday", "p_value", "fri_minus_mon"]].to_string(index=False))
 
 
@@ -348,7 +292,6 @@ def run_within_day_analysis(start_local, end_local, out_dir: Path) -> None:
 			times = np.asarray(d["s0_times"], dtype=float)
 			if times.size < 5:
 				continue
-			# normalize times to start at 0 relative to session
 			t0 = float(times[0])
 			t_rel = times - t0
 			duration = float(t_rel[-1])
@@ -364,7 +307,6 @@ def run_within_day_analysis(start_local, end_local, out_dir: Path) -> None:
 			})
 			session_metrics.append(overall)
 
-			# Early vs late split for long enough sessions
 			if duration >= MIN_SESSION_S_FOR_SPLIT:
 				early_mask = t_rel <= EARLY_END_S
 				late_mask = t_rel > EARLY_END_S
@@ -387,7 +329,8 @@ def run_within_day_analysis(start_local, end_local, out_dir: Path) -> None:
 							"abs_change": lv - ev if np.isfinite(ev) and np.isfinite(lv) else float("nan"),
 							"rel_change": rel_change,
 						})
-					# Stark drop heuristic on key metrics for first-of-day
+					## END for metric in FOCUS_METRICS...
+
 					if sess_i == 0:
 						for metric, direction in [("alpha_rel", "drop"), ("alpha_theta_ratio", "drop"), ("total_power_1.0_to_40.0_hz", "drop"), ("theta_rel", "rise"), ("beta_alpha_ratio", "rise")]:
 							ev, lv = early[metric], late[metric]
@@ -407,9 +350,10 @@ def run_within_day_analysis(start_local, end_local, out_dir: Path) -> None:
 									"rel_change": rel,
 									"duration_s": duration,
 								})
+						## END for metric, direction in ...
+
 		## END for sess_i, (_, srow) in enumerate(day_df.iterrows())...
 
-		# Across-session course within the day
 		for sm in session_metrics:
 			for metric in FOCUS_METRICS:
 				course_rows.append({
@@ -422,6 +366,8 @@ def run_within_day_analysis(start_local, end_local, out_dir: Path) -> None:
 					"metric": metric,
 					"value": sm[metric],
 				})
+			## END for metric in FOCUS_METRICS...
+
 		## END for sm in session_metrics...
 
 	## END for local_date, day_df in npz_index.groupby("local_date", sort=True)...
@@ -433,7 +379,6 @@ def run_within_day_analysis(start_local, end_local, out_dir: Path) -> None:
 	course_df.to_csv(out_dir / "within_day_session_course.csv", index=False)
 	drops_df.to_csv(out_dir / "stark_early_late_events.csv", index=False)
 
-	# Aggregate first-of-day early vs late stats
 	first_splits = splits_df.loc[splits_df["is_first_of_day"]].copy() if not splits_df.empty else splits_df
 	agg_rows = []
 	if not first_splits.empty:
@@ -461,7 +406,6 @@ def run_within_day_analysis(start_local, end_local, out_dir: Path) -> None:
 	agg_df = pd.DataFrame(agg_rows).sort_values("t_p_value", kind="stable") if agg_rows else pd.DataFrame()
 	agg_df.to_csv(out_dir / "first_session_early_vs_late_stats.csv", index=False)
 
-	# Plot paired early/late for first-of-day focus metrics
 	if not first_splits.empty:
 		for metric in FOCUS_METRICS:
 			mdf = first_splits.loc[first_splits["metric"] == metric].sort_values("local_date")
@@ -488,7 +432,6 @@ def run_within_day_analysis(start_local, end_local, out_dir: Path) -> None:
 			plt.close(fig)
 		## END for metric in FOCUS_METRICS...
 
-	# Plot multi-session day courses for days with >=2 sessions
 	if not course_df.empty:
 		multi = course_df.loc[course_df["n_sessions_day"] >= 2]
 		for metric in ["alpha_rel", "theta_rel", "beta_alpha_ratio", "total_power_1.0_to_40.0_hz"]:
@@ -522,13 +465,24 @@ def run_within_day_analysis(start_local, end_local, out_dir: Path) -> None:
 
 
 def main() -> None:
+	parser = argparse.ArgumentParser(description="Mon→Fri weekday trends + within-day early-vs-late analysis")
+	parser.add_argument("--skip-process", action="store_true", help="Skip missing-XDF processing; only merge existing summaries and analyze")
+	parser.add_argument("--missing-csv", type=Path, default=None, help="CSV from run_list_preceding_sessions.py (default: session_summaries/_missing_preceding_two_months.csv)")
+	parser.add_argument("--days", type=int, default=92, help="Analysis window length in local days ending today")
+	parser.add_argument("--chunk-size", type=int, default=3, help="XDF process batch size when NPZ reuse is unavailable")
+	args = parser.parse_args()
+
 	summaries_dir = outputs_root_folder / "session_summaries"
-	missing_csv = summaries_dir / "_missing_preceding_two_months.csv"
-	missing_df = pd.read_csv(missing_csv)
+	missing_csv = args.missing_csv or (summaries_dir / "_missing_preceding_two_months.csv")
 
-	process_missing_xdfs(missing_df)
+	if not args.skip_process:
+		if not missing_csv.is_file():
+			raise SystemExit(f"Missing list not found: {missing_csv.as_posix()}\nRun: uv run --frozen python run_list_preceding_sessions.py")
+		missing_df = pd.read_csv(missing_csv)
+		process_missing_xdfs(missing_df, chunk_size=args.chunk_size)
+	else:
+		print("Skipping process (--skip-process)")
 
-	# Merge all summary CSVs
 	all_csvs = sorted([p for p in summaries_dir.glob("*session_summaries.csv") if not p.name.endswith("_empty.csv") and not p.name.startswith("_")], key=lambda p: p.stat().st_mtime)
 	print(f"Merging {len(all_csvs)} summary CSVs")
 	sessions_loaded = MondayTuesdayComparison.load_session_metrics(all_csvs, timezone_name=DEFAULT_TIMEZONE)
@@ -544,14 +498,18 @@ def main() -> None:
 	sessions_export[template_cols].to_csv(merged_out, index=False)
 	print(f"Merged summary: {merged_out.as_posix()} n={len(sessions_export)}")
 
-	end_local = datetime.now(TZ).date()
-	start_local = end_local - timedelta(days=92)
-	trend_dir = outputs_root_folder / "monday_friday_trend" / datetime.now().strftime("%Y-%m-%d_monday_friday_trend_3mo")
-	within_dir = outputs_root_folder / "within_day_trend" / datetime.now().strftime("%Y-%m-%d_within_day")
+	tz = ZoneInfo(DEFAULT_TIMEZONE)
+	end_local = datetime.now(tz).date()
+	start_local = end_local - timedelta(days=args.days)
+	stamp = datetime.now().strftime("%Y-%m-%d")
+	trend_dir = outputs_root_folder / "monday_friday_trend" / f"{stamp}_monday_friday_trend"
+	within_dir = outputs_root_folder / "within_day_trend" / f"{stamp}_within_day"
 
 	run_weekday_trend(merged_out, start_local, end_local, trend_dir)
 	run_within_day_analysis(start_local, end_local, within_dir)
 	print("\nDONE")
+	print(f"Weekday outputs: {trend_dir.as_posix()}")
+	print(f"Within-day outputs: {within_dir.as_posix()}")
 
 
 if __name__ == "__main__":
