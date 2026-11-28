@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 import threading
 from datetime import datetime, timezone
@@ -30,6 +31,8 @@ from phoofflineeeganalysis.offline_data_manager.session_catalog import (
 )
 from phoofflineeeganalysis.offline_data_manager.source_registry import list_sources as registry_list_sources
 from phoofflineeeganalysis.offline_data_manager.video_ingest_helpers import DEFAULT_MIN_AGE_S
+
+logger = logging.getLogger(__name__)
 
 
 def _ensure_utc_day(day_date: datetime) -> datetime:
@@ -316,7 +319,7 @@ class OfflineDataManagerService:
                 total=0,
                 active_sessions=[],
             )
-        return SpectogramPlottingHelper.process_XDFs_main(
+        result = SpectogramPlottingHelper.process_XDFs_main(
             n_most_recent_sessions_to_preprocess=merged.get("n_most_recent_sessions_to_preprocess"),
             should_write_final_merged_eeg_fif=bool(merged.get("should_write_final_merged_eeg_fif", True)),
             included_xdf_file_names=merged.get("included_xdf_file_names"),
@@ -331,6 +334,26 @@ class OfflineDataManagerService:
             progress_callback=progress,
             cancel_event=cancel_event,
         )
+        if bool(merged.get("warm_timeline_bundles", True)) and not (cancel_event is not None and cancel_event.is_set()):
+            try:
+                from pypho_timeline.feature_store.session_bundle_builder import warm_timeline_bundles_for_xdf_paths
+                warm_targets = list(resolved_paths) if resolved_paths else []
+                if not warm_targets:
+                    cat_df = self.session_catalog.load_calendar_dataframe()
+                    if len(cat_df) > 0 and "xdf_path" in cat_df.columns:
+                        n_recent = merged.get("n_most_recent_sessions_to_preprocess")
+                        all_cat_paths = [Path(str(p)) for p in cat_df["xdf_path"].dropna().tolist() if Path(str(p)).is_file()]
+                        warm_targets = all_cat_paths[-int(n_recent):] if n_recent else all_cat_paths
+                if warm_targets:
+                    warm_timeline_bundles_for_xdf_paths(
+                        warm_targets,
+                        max_workers=int(merged.get("absolute_max_workers") or 2),
+                        progress_callback=progress,
+                        cancel_event=cancel_event,
+                    )
+            except Exception as warm_err:
+                logger.debug("Optional timeline bundle pre-warming skipped: %s", warm_err)
+        return result
 
 
     def calendar_payload(self, *, modality_filters: Optional[Iterable[str]] = None, include_duplicates: bool = False, build_datasource: bool = True) -> Dict[str, Any]:
