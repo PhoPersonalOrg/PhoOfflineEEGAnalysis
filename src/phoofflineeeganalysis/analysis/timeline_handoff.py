@@ -38,11 +38,10 @@ def _to_handoff_time(value: Any) -> Any:
 
 
 def _prefer_cached_from_status(status: Optional[str], prefer_cached_spectrograms: Optional[bool]) -> bool:
+    """Default to preferring cached spectrograms/bundles regardless of catalog status."""
     if prefer_cached_spectrograms is not None:
         return bool(prefer_cached_spectrograms)
-    if status is None:
-        return False
-    return str(status).strip().lower() in _COMPUTED_STATUSES
+    return True
 
 
 def resolve_pyphotimeline_root() -> Path:
@@ -225,7 +224,7 @@ def try_send_show_sessions(sessions: Sequence[Union[str, Path, Dict[str, Any]]],
                 "status": st,
             })
         else:
-            serialized.append({"xdf_path": str(Path(item)), "prefer_cached_spectrograms": False})
+            serialized.append({"xdf_path": str(Path(item)), "prefer_cached_spectrograms": True})
     ## END for item in sessions...
 
     if not serialized:
@@ -278,7 +277,7 @@ def spawn_offline_timeline_sessions(sessions: Sequence[Union[str, Path, Dict[str
                 "status": st,
             })
         else:
-            items.append({"xdf_path": str(Path(s)), "start": None, "end": None, "prefer_cached_spectrograms": False, "status": None})
+            items.append({"xdf_path": str(Path(s)), "start": None, "end": None, "prefer_cached_spectrograms": True, "status": None})
     ## END for s in sessions...
 
     if not items:
